@@ -104,11 +104,12 @@ enum Palette {
     Neon,
     Frost,
     Earth,
+    Sakura,
 }
 
-const ALL_PALETTES: [Palette; 6] = [
+const ALL_PALETTES: [Palette; 7] = [
     Palette::Twilight, Palette::Ocean, Palette::Fire,
-    Palette::Neon, Palette::Frost, Palette::Earth,
+    Palette::Neon, Palette::Frost, Palette::Earth, Palette::Sakura,
 ];
 
 impl std::fmt::Display for FractalType {
@@ -135,6 +136,7 @@ impl std::fmt::Display for Palette {
             Self::Neon => write!(f, "neon"),
             Self::Frost => write!(f, "frost"),
             Self::Earth => write!(f, "earth"),
+            Self::Sakura => write!(f, "sakura"),
         }
     }
 }
@@ -172,6 +174,11 @@ fn palette_anchors(palette: Palette) -> Vec<[u8; 3]> {
             [15, 10, 5], [40, 25, 10], [80, 50, 20], [130, 80, 30],
             [180, 120, 50], [210, 170, 80], [230, 210, 140], [245, 240, 200],
             [180, 200, 130], [100, 150, 80], [50, 100, 50], [20, 50, 20],
+        ],
+        Palette::Sakura => vec![
+            [30, 5, 20], [80, 10, 50], [150, 30, 80], [200, 60, 120],
+            [240, 110, 160], [255, 170, 200], [255, 220, 230], [255, 245, 245],
+            [255, 200, 210], [230, 130, 170], [180, 60, 110], [100, 20, 60],
         ],
     }
 }
