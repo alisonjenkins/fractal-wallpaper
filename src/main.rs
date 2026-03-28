@@ -91,6 +91,10 @@ struct Cli {
     /// Image height in pixels
     #[arg(long, default_value_t = DEFAULT_HEIGHT)]
     height: u32,
+
+    /// Supersampling factor for anti-aliasing (2 = render at 2x, then downsample)
+    #[arg(long, default_value_t = 1)]
+    supersample: u32,
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq)]
@@ -1791,6 +1795,37 @@ fn find_interesting_flame(rng: &mut Rng) -> FractalParams {
 
 // ── Rendering ───────────────────────────────────────────────────────────────
 
+/// Downsample an image by averaging NxN blocks of pixels.
+fn downsample(img: &RgbImage, factor: u32) -> RgbImage {
+    if factor <= 1 { return img.clone(); }
+    let new_w = img.width() / factor;
+    let new_h = img.height() / factor;
+    let mut out = RgbImage::new(new_w, new_h);
+    let f2 = (factor * factor) as u32;
+
+    for ny in 0..new_h {
+        for nx in 0..new_w {
+            let mut r_sum = 0u32;
+            let mut g_sum = 0u32;
+            let mut b_sum = 0u32;
+            for sy in 0..factor {
+                for sx in 0..factor {
+                    let p = img.get_pixel(nx * factor + sx, ny * factor + sy);
+                    r_sum += p[0] as u32;
+                    g_sum += p[1] as u32;
+                    b_sum += p[2] as u32;
+                }
+            }
+            out.put_pixel(nx, ny, Rgb([
+                (r_sum / f2) as u8,
+                (g_sum / f2) as u8,
+                (b_sum / f2) as u8,
+            ]));
+        }
+    }
+    out
+}
+
 fn render(
     data: &[f64], width: u32, height: u32, palette: Palette,
     color_offset: f64, cycle_factor: f64,
@@ -1837,9 +1872,12 @@ fn generate(
     samples: Option<u64>,
     width: u32,
     height: u32,
+    supersample: u32,
     output: Option<PathBuf>,
     rng: &mut Rng,
 ) {
+    let render_w = width * supersample;
+    let render_h = height * supersample;
     let seed = rng.next_u64();
     let t_search = Instant::now();
     let mut params = match fractal {
@@ -1871,43 +1909,48 @@ fn generate(
         search_time.as_secs_f64(),
     );
 
+    if supersample > 1 {
+        println!("  Rendering at {render_w}x{render_h} (supersample {supersample}x)");
+    }
+
     let t0 = Instant::now();
     let img = match fractal {
         FractalType::Mandelbrot => {
-            let data = compute_mandelbrot(width, height, params.center, params.zoom, max_iter);
-            render(&data, width, height, palette, params.color_offset, 12.0)
+            let data = compute_mandelbrot(render_w, render_h, params.center, params.zoom, max_iter);
+            render(&data, render_w, render_h, palette, params.color_offset, 12.0)
         }
         FractalType::Julia => {
             let c = params.julia_c.unwrap();
-            let data = compute_julia(width, height, c, params.zoom, max_iter);
-            render(&data, width, height, palette, params.color_offset, 12.0)
+            let data = compute_julia(render_w, render_h, c, params.zoom, max_iter);
+            render(&data, render_w, render_h, palette, params.color_offset, 12.0)
         }
         FractalType::BurningShip => {
-            let data = compute_burning_ship(width, height, params.center, params.zoom, max_iter);
-            render(&data, width, height, palette, params.color_offset, 12.0)
+            let data = compute_burning_ship(render_w, render_h, params.center, params.zoom, max_iter);
+            render(&data, render_w, render_h, palette, params.color_offset, 12.0)
         }
         FractalType::Newton => {
-            let data = compute_newton(width, height, params.center, params.zoom, max_iter.min(500));
-            render(&data, width, height, palette, params.color_offset, 12.0)
+            let data = compute_newton(render_w, render_h, params.center, params.zoom, max_iter.min(500));
+            render(&data, render_w, render_h, palette, params.color_offset, 12.0)
         }
         FractalType::StrangeAttractor => {
             let (a, b, c, d) = params.attractor_params.unwrap();
             let at = params.attractor_type.unwrap();
-            let data = compute_attractor(width, height, a, b, c, d, at, params.samples, seed);
-            render(&data, width, height, palette, params.color_offset, 2.0)
+            let data = compute_attractor(render_w, render_h, a, b, c, d, at, params.samples, seed);
+            render(&data, render_w, render_h, palette, params.color_offset, 2.0)
         }
         FractalType::Buddhabrot => {
             let (ri, gi, bi) = params.buddhabrot_iters.unwrap();
-            let (r, g, b) = compute_buddhabrot(width, height, params.samples, ri, gi, bi, seed);
-            render_buddhabrot(&r, &g, &b, width, height)
+            let (r, g, b) = compute_buddhabrot(render_w, render_h, params.samples, ri, gi, bi, seed);
+            render_buddhabrot(&r, &g, &b, render_w, render_h)
         }
         FractalType::Flame => {
             let transforms = params.flame_transforms.as_ref().unwrap();
-            let (density, color_map) = compute_flame(width, height, transforms, params.samples, seed);
-            render_flame(&density, &color_map, width, height, palette, params.color_offset)
+            let (density, color_map) = compute_flame(render_w, render_h, transforms, params.samples, seed);
+            render_flame(&density, &color_map, render_w, render_h, palette, params.color_offset)
         }
         FractalType::All => unreachable!(),
     };
+    let img = downsample(&img, supersample);
     let t1 = Instant::now();
     println!("  Computed in {:.2}s", (t1 - t0).as_secs_f64());
 
@@ -1945,12 +1988,12 @@ fn main() {
             ];
             for ft in types {
                 let pal = cli.palette.unwrap_or_else(|| rng.choose(&ALL_PALETTES));
-                generate(ft, pal, cli.max_iter, cli.samples, cli.width, cli.height, None, &mut rng);
+                generate(ft, pal, cli.max_iter, cli.samples, cli.width, cli.height, cli.supersample, None, &mut rng);
             }
         }
         ft => {
             let pal = cli.palette.unwrap_or_else(|| rng.choose(&ALL_PALETTES));
-            generate(ft, pal, cli.max_iter, cli.samples, cli.width, cli.height, cli.output, &mut rng);
+            generate(ft, pal, cli.max_iter, cli.samples, cli.width, cli.height, cli.supersample, cli.output, &mut rng);
         }
     }
 }
