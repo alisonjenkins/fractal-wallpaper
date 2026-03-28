@@ -120,7 +120,7 @@ enum FractalType {
     All,
 }
 
-#[derive(Clone, Copy, ValueEnum, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, ValueEnum, Serialize, Deserialize)]
 enum Palette {
     Twilight,
     Ocean,
@@ -129,11 +129,13 @@ enum Palette {
     Frost,
     Earth,
     Sakura,
+    Random,
 }
 
-const ALL_PALETTES: [Palette; 7] = [
+const ALL_PALETTES: [Palette; 8] = [
     Palette::Twilight, Palette::Ocean, Palette::Fire,
     Palette::Neon, Palette::Frost, Palette::Earth, Palette::Sakura,
+    Palette::Random,
 ];
 
 impl std::fmt::Display for FractalType {
@@ -163,8 +165,108 @@ impl std::fmt::Display for Palette {
             Self::Frost => write!(f, "frost"),
             Self::Earth => write!(f, "earth"),
             Self::Sakura => write!(f, "sakura"),
+            Self::Random => write!(f, "random"),
         }
     }
+}
+
+// ── Color Theory Palette Generator ──────────────────────────────────────────
+
+/// Convert HSL (h: 0-360, s: 0-1, l: 0-1) to RGB (0-255).
+fn hsl_to_rgb(h: f64, s: f64, l: f64) -> [u8; 3] {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let h2 = h / 60.0;
+    let x = c * (1.0 - (h2 % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = match h2 as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    [
+        ((r1 + m) * 255.0).clamp(0.0, 255.0) as u8,
+        ((g1 + m) * 255.0).clamp(0.0, 255.0) as u8,
+        ((b1 + m) * 255.0).clamp(0.0, 255.0) as u8,
+    ]
+}
+
+/// Color harmony schemes for generating pleasing palettes.
+#[derive(Clone, Copy)]
+enum Harmony {
+    Complementary,   // Base + opposite
+    Analogous,       // Base + neighbors
+    Triadic,         // Base + 120° + 240°
+    SplitComplementary, // Base + opposite±30°
+    Tetradic,        // Base + 90° + 180° + 270°
+}
+
+/// Generate a 12-anchor palette using color theory.
+fn generate_random_palette(rng: &mut Rng) -> Vec<[u8; 3]> {
+    let harmonies = [
+        Harmony::Complementary,
+        Harmony::Analogous,
+        Harmony::Triadic,
+        Harmony::SplitComplementary,
+        Harmony::Tetradic,
+    ];
+    let harmony = rng.choose(&harmonies);
+
+    // Pick a random base hue
+    let base_hue = rng.range(0.0, 360.0);
+    // Base saturation — avoid too desaturated
+    let base_sat = rng.range(0.5, 1.0);
+
+    // Generate key hues based on the harmony scheme
+    let key_hues: Vec<f64> = match harmony {
+        Harmony::Complementary => vec![base_hue, (base_hue + 180.0) % 360.0],
+        Harmony::Analogous => vec![
+            base_hue,
+            (base_hue + 30.0) % 360.0,
+            (base_hue + 330.0) % 360.0, // -30
+        ],
+        Harmony::Triadic => vec![
+            base_hue,
+            (base_hue + 120.0) % 360.0,
+            (base_hue + 240.0) % 360.0,
+        ],
+        Harmony::SplitComplementary => vec![
+            base_hue,
+            (base_hue + 150.0) % 360.0,
+            (base_hue + 210.0) % 360.0,
+        ],
+        Harmony::Tetradic => vec![
+            base_hue,
+            (base_hue + 90.0) % 360.0,
+            (base_hue + 180.0) % 360.0,
+            (base_hue + 270.0) % 360.0,
+        ],
+    };
+
+    // Build 12 anchors by cycling through key hues with varying lightness
+    // Pattern: dark → mid → bright → highlight → mid → dark (creates a smooth cycle)
+    let lightness_curve = [
+        0.08, 0.15, 0.25, 0.40, 0.55, 0.70, 0.85, 0.95,
+        0.75, 0.50, 0.30, 0.12,
+    ];
+    let saturation_curve = [
+        0.6, 0.8, 0.9, 1.0, 0.9, 0.7, 0.4, 0.2,
+        0.6, 0.9, 1.0, 0.7,
+    ];
+
+    let mut anchors = Vec::with_capacity(12);
+    for i in 0..12 {
+        let hue_idx = i % key_hues.len();
+        // Slight hue variation per anchor for richness
+        let hue = (key_hues[hue_idx] + rng.range(-10.0, 10.0)).rem_euclid(360.0);
+        let sat = (base_sat * saturation_curve[i] + rng.range(-0.05, 0.05)).clamp(0.0, 1.0);
+        let lit = (lightness_curve[i] + rng.range(-0.03, 0.03)).clamp(0.02, 0.98);
+        anchors.push(hsl_to_rgb(hue, sat, lit));
+    }
+
+    anchors
 }
 
 // ── Color Palettes ──────────────────────────────────────────────────────────
@@ -206,11 +308,22 @@ fn palette_anchors(palette: Palette) -> Vec<[u8; 3]> {
             [240, 110, 160], [255, 170, 200], [255, 220, 230], [255, 245, 245],
             [255, 200, 210], [230, 130, 170], [180, 60, 110], [100, 20, 60],
         ],
+        Palette::Random => {
+            // Fallback if Random reaches here unresolved — use a pleasant default
+            vec![
+                [10, 2, 30], [40, 5, 80], [90, 20, 140], [160, 50, 180],
+                [220, 100, 160], [255, 160, 120], [255, 220, 180], [255, 255, 240],
+                [200, 180, 255], [120, 100, 200], [60, 40, 140], [20, 10, 60],
+            ]
+        }
     }
 }
 
 fn build_colormap(palette: Palette, n: usize) -> Vec<[u8; 3]> {
-    let anchors = palette_anchors(palette);
+    build_colormap_from_anchors(&palette_anchors(palette), n)
+}
+
+fn build_colormap_from_anchors(anchors: &[[u8; 3]], n: usize) -> Vec<[u8; 3]> {
     let num = anchors.len();
     let xs: Vec<f64> = (0..num).map(|i| i as f64 / (num - 1) as f64).collect();
     (0..n)
@@ -565,6 +678,8 @@ struct FractalParams {
     buddhabrot_iters: Option<(u32, u32, u32)>,
     flame_transforms: Option<Vec<FlameTransform>>,
     samples: u64,
+    /// Pre-generated palette anchors for Random palette
+    random_palette: Option<Vec<[u8; 3]>>,
 }
 
 /// Saved parameter file format — includes everything needed to reproduce a fractal.
@@ -604,6 +719,7 @@ impl Default for FractalParams {
             buddhabrot_iters: None,
             flame_transforms: None,
             samples: 0,
+            random_palette: None,
         }
     }
 }
@@ -1667,9 +1783,9 @@ fn compute_buddhabrot(
 fn render_buddhabrot(
     r_data: &[f64], g_data: &[f64], b_data: &[f64],
     width: u32, height: u32,
-    palette: Palette, color_offset: f64,
+    anchors: &[[u8; 3]], color_offset: f64,
 ) -> RgbImage {
-    let cmap = build_colormap(palette, 2048);
+    let cmap = build_colormap_from_anchors(anchors, 2048);
     let cmap_len = cmap.len();
     let offset = (color_offset * cmap_len as f64) as usize;
     let gamma = 0.4;
@@ -1906,9 +2022,9 @@ fn compute_flame(
 fn render_flame(
     density: &[f64], color_map: &[f64],
     width: u32, height: u32,
-    palette: Palette, color_offset: f64,
+    anchors: &[[u8; 3]], color_offset: f64,
 ) -> RgbImage {
-    let cmap = build_colormap(palette, 2048);
+    let cmap = build_colormap_from_anchors(anchors, 2048);
     let cmap_len = cmap.len();
     let offset = (color_offset * cmap_len as f64) as usize;
 
@@ -2128,10 +2244,10 @@ fn downsample(img: &RgbImage, factor: u32) -> RgbImage {
 }
 
 fn render(
-    data: &[f64], width: u32, height: u32, palette: Palette,
+    data: &[f64], width: u32, height: u32, anchors: &[[u8; 3]],
     color_offset: f64, cycle_factor: f64,
 ) -> RgbImage {
-    let cmap = build_colormap(palette, 2048);
+    let cmap = build_colormap_from_anchors(anchors, 2048);
     let cmap_len = cmap.len();
     let offset = (color_offset * cmap_len as f64) as usize;
 
@@ -2201,6 +2317,18 @@ fn generate(
         params.samples = s;
     }
 
+    // Resolve Random palette to concrete anchors
+    if palette == Palette::Random && params.random_palette.is_none() {
+        params.random_palette = Some(generate_random_palette(rng));
+    }
+
+    // Get the resolved anchors for rendering
+    let anchors = if let Some(ref custom) = params.random_palette {
+        custom.clone()
+    } else {
+        palette_anchors(palette)
+    };
+
     let out_path = output.unwrap_or_else(|| {
         PathBuf::from(format!("fractal_{fractal}_{palette}_{width}x{height}.png"))
     });
@@ -2230,6 +2358,7 @@ fn generate(
                 buddhabrot_iters: params.buddhabrot_iters,
                 flame_transforms: params.flame_transforms.clone(),
                 samples: params.samples,
+                random_palette: params.random_palette.clone(),
             },
         };
         let json = serde_json::to_string_pretty(&saved).expect("Failed to serialize params");
@@ -2245,45 +2374,45 @@ fn generate(
     let img = match fractal {
         FractalType::Mandelbrot => {
             let data = compute_mandelbrot(render_w, render_h, params.center, params.zoom, max_iter);
-            render(&data, render_w, render_h, palette, params.color_offset, 12.0)
+            render(&data, render_w, render_h, &anchors, params.color_offset, 12.0)
         }
         FractalType::Julia => {
             let c = params.julia_c.unwrap();
             let data = compute_julia(render_w, render_h, c, params.zoom, max_iter);
-            render(&data, render_w, render_h, palette, params.color_offset, 12.0)
+            render(&data, render_w, render_h, &anchors, params.color_offset, 12.0)
         }
         FractalType::BurningShip => {
             let data = compute_burning_ship(render_w, render_h, params.center, params.zoom, max_iter);
-            render(&data, render_w, render_h, palette, params.color_offset, 12.0)
+            render(&data, render_w, render_h, &anchors, params.color_offset, 12.0)
         }
         FractalType::Newton => {
             let data = compute_newton(render_w, render_h, params.center, params.zoom, max_iter.min(500));
-            render(&data, render_w, render_h, palette, params.color_offset, 12.0)
+            render(&data, render_w, render_h, &anchors, params.color_offset, 12.0)
         }
         FractalType::Tricorn => {
             let data = compute_tricorn(render_w, render_h, params.center, params.zoom, max_iter);
-            render(&data, render_w, render_h, palette, params.color_offset, 12.0)
+            render(&data, render_w, render_h, &anchors, params.color_offset, 12.0)
         }
         FractalType::Phoenix => {
             let c = params.julia_c.unwrap();
             let data = compute_phoenix(render_w, render_h, c, params.zoom, max_iter);
-            render(&data, render_w, render_h, palette, params.color_offset, 12.0)
+            render(&data, render_w, render_h, &anchors, params.color_offset, 12.0)
         }
         FractalType::StrangeAttractor => {
             let (a, b, c, d) = params.attractor_params.unwrap();
             let at = params.attractor_type.unwrap();
             let data = compute_attractor(render_w, render_h, a, b, c, d, at, params.samples, seed);
-            render(&data, render_w, render_h, palette, params.color_offset, 2.0)
+            render(&data, render_w, render_h, &anchors, params.color_offset, 2.0)
         }
         FractalType::Buddhabrot => {
             let (ri, gi, bi) = params.buddhabrot_iters.unwrap();
             let (r, g, b) = compute_buddhabrot(render_w, render_h, params.samples, ri, gi, bi, seed);
-            render_buddhabrot(&r, &g, &b, render_w, render_h, palette, params.color_offset)
+            render_buddhabrot(&r, &g, &b, render_w, render_h, &anchors, params.color_offset)
         }
         FractalType::Flame => {
             let transforms = params.flame_transforms.as_ref().unwrap();
             let (density, color_map) = compute_flame(render_w, render_h, transforms, params.samples, seed);
-            render_flame(&density, &color_map, render_w, render_h, palette, params.color_offset)
+            render_flame(&density, &color_map, render_w, render_h, &anchors, params.color_offset)
         }
         FractalType::All => unreachable!(),
     };
@@ -2318,6 +2447,13 @@ fn main() {
             ))
         });
 
+        // Resolve palette anchors (handles Random with saved anchors)
+        let anchors = if let Some(ref custom) = saved.params.random_palette {
+            custom.clone()
+        } else {
+            palette_anchors(saved.palette)
+        };
+
         // Use loaded params directly — skip parameter search
         let render_w = cli.width * cli.supersample;
         let render_h = cli.height * cli.supersample;
@@ -2331,45 +2467,45 @@ fn main() {
         let img = match saved.fractal {
             FractalType::Mandelbrot => {
                 let data = compute_mandelbrot(render_w, render_h, saved.params.center, saved.params.zoom, saved.max_iter);
-                render(&data, render_w, render_h, saved.palette, saved.params.color_offset, 12.0)
+                render(&data, render_w, render_h, &anchors, saved.params.color_offset, 12.0)
             }
             FractalType::Julia => {
                 let c = saved.params.julia_c.unwrap();
                 let data = compute_julia(render_w, render_h, c, saved.params.zoom, saved.max_iter);
-                render(&data, render_w, render_h, saved.palette, saved.params.color_offset, 12.0)
+                render(&data, render_w, render_h, &anchors, saved.params.color_offset, 12.0)
             }
             FractalType::BurningShip => {
                 let data = compute_burning_ship(render_w, render_h, saved.params.center, saved.params.zoom, saved.max_iter);
-                render(&data, render_w, render_h, saved.palette, saved.params.color_offset, 12.0)
+                render(&data, render_w, render_h, &anchors, saved.params.color_offset, 12.0)
             }
             FractalType::Newton => {
                 let data = compute_newton(render_w, render_h, saved.params.center, saved.params.zoom, saved.max_iter.min(500));
-                render(&data, render_w, render_h, saved.palette, saved.params.color_offset, 12.0)
+                render(&data, render_w, render_h, &anchors, saved.params.color_offset, 12.0)
             }
             FractalType::Tricorn => {
                 let data = compute_tricorn(render_w, render_h, saved.params.center, saved.params.zoom, saved.max_iter);
-                render(&data, render_w, render_h, saved.palette, saved.params.color_offset, 12.0)
+                render(&data, render_w, render_h, &anchors, saved.params.color_offset, 12.0)
             }
             FractalType::Phoenix => {
                 let c = saved.params.julia_c.unwrap();
                 let data = compute_phoenix(render_w, render_h, c, saved.params.zoom, saved.max_iter);
-                render(&data, render_w, render_h, saved.palette, saved.params.color_offset, 12.0)
+                render(&data, render_w, render_h, &anchors, saved.params.color_offset, 12.0)
             }
             FractalType::StrangeAttractor => {
                 let (a, b, c, d) = saved.params.attractor_params.unwrap();
                 let at = saved.params.attractor_type.unwrap();
                 let data = compute_attractor(render_w, render_h, a, b, c, d, at, saved.params.samples, seed);
-                render(&data, render_w, render_h, saved.palette, saved.params.color_offset, 2.0)
+                render(&data, render_w, render_h, &anchors, saved.params.color_offset, 2.0)
             }
             FractalType::Buddhabrot => {
                 let (ri, gi, bi) = saved.params.buddhabrot_iters.unwrap();
                 let (r, g, b) = compute_buddhabrot(render_w, render_h, saved.params.samples, ri, gi, bi, seed);
-                render_buddhabrot(&r, &g, &b, render_w, render_h, saved.palette, saved.params.color_offset)
+                render_buddhabrot(&r, &g, &b, render_w, render_h, &anchors, saved.params.color_offset)
             }
             FractalType::Flame => {
                 let transforms = saved.params.flame_transforms.as_ref().unwrap();
                 let (density, color_map) = compute_flame(render_w, render_h, transforms, saved.params.samples, seed);
-                render_flame(&density, &color_map, render_w, render_h, saved.palette, saved.params.color_offset)
+                render_flame(&density, &color_map, render_w, render_h, &anchors, saved.params.color_offset)
             }
             FractalType::All => unreachable!(),
         };
