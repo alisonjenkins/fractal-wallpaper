@@ -2,6 +2,7 @@ use clap::{Parser, ValueEnum};
 use image::{Rgb, RgbImage};
 use rayon::prelude::*;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 const WIDTH: u32 = 5440;
@@ -77,6 +78,10 @@ struct Cli {
     /// Random seed (uses system time if not specified)
     #[arg(short, long)]
     seed: Option<u64>,
+
+    /// Number of samples for histogram-based fractals (flame, buddhabrot, attractor)
+    #[arg(long)]
+    samples: Option<u64>,
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq)]
@@ -85,6 +90,9 @@ enum FractalType {
     Julia,
     BurningShip,
     Newton,
+    Flame,
+    Buddhabrot,
+    StrangeAttractor,
     All,
 }
 
@@ -110,6 +118,9 @@ impl std::fmt::Display for FractalType {
             Self::Julia => write!(f, "julia"),
             Self::BurningShip => write!(f, "burning-ship"),
             Self::Newton => write!(f, "newton"),
+            Self::Flame => write!(f, "flame"),
+            Self::Buddhabrot => write!(f, "buddhabrot"),
+            Self::StrangeAttractor => write!(f, "strange-attractor"),
             Self::All => write!(f, "all"),
         }
     }
@@ -192,6 +203,46 @@ fn build_colormap(palette: Palette, n: usize) -> Vec<[u8; 3]> {
                 (a[2] as f64 + (b[2] as f64 - a[2] as f64) * local_t) as u8,
             ]
         })
+        .collect()
+}
+
+// ── Histogram (for density-based fractals) ──────────────────────────────────
+
+struct Histogram {
+    bins: Vec<AtomicU64>,
+    width: u32,
+    height: u32,
+}
+
+impl Histogram {
+    fn new(width: u32, height: u32) -> Self {
+        let n = (width as usize) * (height as usize);
+        let mut bins = Vec::with_capacity(n);
+        for _ in 0..n {
+            bins.push(AtomicU64::new(0));
+        }
+        Self { bins, width, height }
+    }
+
+    fn increment(&self, x: u32, y: u32) {
+        if x < self.width && y < self.height {
+            let idx = y as usize * self.width as usize + x as usize;
+            self.bins[idx].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn to_vec_f64(&self) -> Vec<f64> {
+        self.bins
+            .iter()
+            .map(|b| b.load(Ordering::Relaxed) as f64)
+            .collect()
+    }
+}
+
+fn tone_map_log(histogram: &[f64]) -> Vec<f64> {
+    histogram
+        .iter()
+        .map(|&v| if v > 0.0 { v.ln_1p() } else { 0.0 })
         .collect()
 }
 
@@ -399,14 +450,49 @@ struct FractalParams {
     zoom: f64,
     julia_c: Option<(f64, f64)>,
     color_offset: f64,
+    attractor_params: Option<(f64, f64, f64, f64)>,
+    attractor_type: Option<AttractorType>,
+    buddhabrot_iters: Option<(u32, u32, u32)>,
+    flame_transforms: Option<Vec<FlameTransform>>,
+    samples: u64,
+}
+
+#[derive(Clone, Copy)]
+enum AttractorType {
+    Clifford,
+    DeJong,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+struct FlameTransform {
+    a: f64, b: f64, c: f64, d: f64, e: f64, f: f64,
+    variations: [f64; 10],
+    weight: f64,
+    color: f64,
+}
+
+impl Default for FractalParams {
+    fn default() -> Self {
+        Self {
+            center: (0.0, 0.0),
+            zoom: 1.0,
+            julia_c: None,
+            color_offset: 0.0,
+            attractor_params: None,
+            attractor_type: None,
+            buddhabrot_iters: None,
+            flame_transforms: None,
+            samples: 0,
+        }
+    }
 }
 
 fn find_interesting_mandelbrot(rng: &mut Rng, max_iter: u32) -> FractalParams {
     let mut best_params = FractalParams {
         center: (-0.75, 0.0),
-        zoom: 1.0,
-        julia_c: None,
         color_offset: rng.f64(),
+        ..Default::default()
     };
     let mut best_score = 0.0f64;
 
@@ -433,8 +519,8 @@ fn find_interesting_mandelbrot(rng: &mut Rng, max_iter: u32) -> FractalParams {
             best_params = FractalParams {
                 center: boundary,
                 zoom,
-                julia_c: None,
                 color_offset: rng.f64(),
+                ..Default::default()
             };
         }
 
@@ -448,10 +534,9 @@ fn find_interesting_mandelbrot(rng: &mut Rng, max_iter: u32) -> FractalParams {
 
 fn find_interesting_julia(rng: &mut Rng, max_iter: u32) -> FractalParams {
     let mut best_params = FractalParams {
-        center: (0.0, 0.0),
-        zoom: 1.0,
         julia_c: Some((-0.7269, 0.1889)),
         color_offset: rng.f64(),
+        ..Default::default()
     };
     let mut best_score = 0.0f64;
 
@@ -480,10 +565,10 @@ fn find_interesting_julia(rng: &mut Rng, max_iter: u32) -> FractalParams {
         if score > best_score {
             best_score = score;
             best_params = FractalParams {
-                center: (0.0, 0.0),
                 zoom,
                 julia_c: Some(c),
                 color_offset: rng.f64(),
+                ..Default::default()
             };
         }
 
@@ -499,8 +584,8 @@ fn find_interesting_burning_ship(rng: &mut Rng, max_iter: u32) -> FractalParams 
     let mut best_params = FractalParams {
         center: (-1.75, -0.04),
         zoom: 30.0,
-        julia_c: None,
         color_offset: rng.f64(),
+        ..Default::default()
     };
     let mut best_score = 0.0f64;
 
@@ -542,8 +627,8 @@ fn find_interesting_burning_ship(rng: &mut Rng, max_iter: u32) -> FractalParams 
             best_params = FractalParams {
                 center,
                 zoom,
-                julia_c: None,
                 color_offset: rng.f64(),
+                ..Default::default()
             };
         }
 
@@ -564,8 +649,8 @@ fn find_interesting_newton(rng: &mut Rng, _max_iter: u32) -> FractalParams {
     FractalParams {
         center,
         zoom,
-        julia_c: None,
         color_offset: rng.f64(),
+        ..Default::default()
     }
 }
 
@@ -733,9 +818,676 @@ fn compute_newton(
     result
 }
 
+// ── Strange Attractor ───────────────────────────────────────────────────────
+
+fn compute_attractor(
+    width: u32, height: u32,
+    a: f64, b: f64, c: f64, d: f64,
+    at: AttractorType,
+    samples: u64,
+    rng_seed: u64,
+) -> Vec<f64> {
+    // Pre-compute bounding box with a short orbit
+    let mut x = 0.1f64;
+    let mut y = 0.1f64;
+    let mut x_min = f64::MAX;
+    let mut x_max = f64::MIN;
+    let mut y_min = f64::MAX;
+    let mut y_max = f64::MIN;
+
+    for _ in 0..200_000 {
+        let (xn, yn) = match at {
+            AttractorType::Clifford => (
+                (a * y).sin() + c * (a * x).cos(),
+                (b * x).sin() + d * (b * y).cos(),
+            ),
+            AttractorType::DeJong => (
+                (a * y).sin() - (b * x).cos(),
+                (c * x).sin() - (d * y).cos(),
+            ),
+        };
+        x = xn;
+        y = yn;
+        if x.is_finite() && y.is_finite() {
+            x_min = x_min.min(x);
+            x_max = x_max.max(x);
+            y_min = y_min.min(y);
+            y_max = y_max.max(y);
+        }
+    }
+
+    let margin = 0.05;
+    let x_range = (x_max - x_min) * (1.0 + margin);
+    let y_range = (y_max - y_min) * (1.0 + margin);
+    let x_center = (x_min + x_max) / 2.0;
+    let y_center = (y_min + y_max) / 2.0;
+
+    let aspect = width as f64 / height as f64;
+    let (view_w, view_h) = if x_range / y_range > aspect {
+        (x_range, x_range / aspect)
+    } else {
+        (y_range * aspect, y_range)
+    };
+    let vx_min = x_center - view_w / 2.0;
+    let vy_min = y_center - view_h / 2.0;
+
+    let histogram = Histogram::new(width, height);
+    let num_threads = rayon::current_num_threads().max(1);
+    let samples_per_thread = samples / num_threads as u64;
+
+    (0..num_threads).into_par_iter().for_each(|tid| {
+        let mut rng = Rng::new(rng_seed.wrapping_add((tid as u64).wrapping_mul(0x9e3779b97f4a7c15)));
+        let mut x = rng.range(-0.1, 0.1);
+        let mut y = rng.range(-0.1, 0.1);
+
+        for i in 0..samples_per_thread {
+            let (xn, yn) = match at {
+                AttractorType::Clifford => (
+                    (a * y).sin() + c * (a * x).cos(),
+                    (b * x).sin() + d * (b * y).cos(),
+                ),
+                AttractorType::DeJong => (
+                    (a * y).sin() - (b * x).cos(),
+                    (c * x).sin() - (d * y).cos(),
+                ),
+            };
+            x = xn;
+            y = yn;
+
+            if i < 100 { continue; }
+
+            let px = ((x - vx_min) / view_w * width as f64) as i64;
+            let py = ((y - vy_min) / view_h * height as f64) as i64;
+            if px >= 0 && px < width as i64 && py >= 0 && py < height as i64 {
+                histogram.increment(px as u32, py as u32);
+            }
+        }
+    });
+
+    tone_map_log(&histogram.to_vec_f64())
+}
+
+fn score_attractor_params(a: f64, b: f64, c: f64, d: f64, at: AttractorType) -> f64 {
+    let probe_w: u32 = 272;
+    let probe_h: u32 = 72;
+    let probe_samples: u64 = 200_000;
+
+    let mut x = 0.1f64;
+    let mut y = 0.1f64;
+    let mut x_min = f64::MAX;
+    let mut x_max = f64::MIN;
+    let mut y_min = f64::MAX;
+    let mut y_max = f64::MIN;
+
+    for i in 0..probe_samples {
+        let (xn, yn) = match at {
+            AttractorType::Clifford => (
+                (a * y).sin() + c * (a * x).cos(),
+                (b * x).sin() + d * (b * y).cos(),
+            ),
+            AttractorType::DeJong => (
+                (a * y).sin() - (b * x).cos(),
+                (c * x).sin() - (d * y).cos(),
+            ),
+        };
+        x = xn;
+        y = yn;
+
+        if !x.is_finite() || !y.is_finite() || x.abs() > 1e10 || y.abs() > 1e10 {
+            return 0.0; // Divergent
+        }
+
+        if i > 100 {
+            x_min = x_min.min(x);
+            x_max = x_max.max(x);
+            y_min = y_min.min(y);
+            y_max = y_max.max(y);
+        }
+    }
+
+    let bbox_w = x_max - x_min;
+    let bbox_h = y_max - y_min;
+    if bbox_w < 0.5 || bbox_h < 0.5 {
+        return 0.0; // Fixed point or tiny orbit
+    }
+
+    // Accumulate into a small probe histogram
+    let aspect = probe_w as f64 / probe_h as f64;
+    let (vw, vh) = if bbox_w / bbox_h > aspect {
+        (bbox_w * 1.05, bbox_w * 1.05 / aspect)
+    } else {
+        (bbox_h * 1.05 * aspect, bbox_h * 1.05)
+    };
+    let vx = (x_min + x_max) / 2.0 - vw / 2.0;
+    let vy = (y_min + y_max) / 2.0 - vh / 2.0;
+
+    let mut histogram = vec![0u32; probe_w as usize * probe_h as usize];
+    x = 0.1;
+    y = 0.1;
+    for i in 0..probe_samples {
+        let (xn, yn) = match at {
+            AttractorType::Clifford => (
+                (a * y).sin() + c * (a * x).cos(),
+                (b * x).sin() + d * (b * y).cos(),
+            ),
+            AttractorType::DeJong => (
+                (a * y).sin() - (b * x).cos(),
+                (c * x).sin() - (d * y).cos(),
+            ),
+        };
+        x = xn;
+        y = yn;
+        if i < 100 { continue; }
+
+        let px = ((x - vx) / vw * probe_w as f64) as i64;
+        let py = ((y - vy) / vh * probe_h as f64) as i64;
+        if px >= 0 && px < probe_w as i64 && py >= 0 && py < probe_h as i64 {
+            histogram[py as usize * probe_w as usize + px as usize] += 1;
+        }
+    }
+
+    let total = histogram.len();
+    let filled = histogram.iter().filter(|&&v| v > 0).count();
+    let fill_rate = filled as f64 / total as f64;
+
+    // Want 5-40% fill
+    let fill_score = if fill_rate < 0.03 || fill_rate > 0.60 {
+        0.1
+    } else if fill_rate >= 0.05 && fill_rate <= 0.40 {
+        1.0
+    } else {
+        0.5
+    };
+
+    // Check spread across 4 horizontal quarters
+    let qw = probe_w as usize / 4;
+    let mut quarters_active = 0u32;
+    for q in 0..4 {
+        let mut q_filled = 0;
+        let mut q_total = 0;
+        for row in 0..probe_h as usize {
+            for col in (q * qw)..((q + 1) * qw) {
+                q_total += 1;
+                if histogram[row * probe_w as usize + col] > 0 {
+                    q_filled += 1;
+                }
+            }
+        }
+        if q_filled as f64 / q_total as f64 > 0.02 {
+            quarters_active += 1;
+        }
+    }
+    let spread_score = match quarters_active {
+        4 => 1.0,
+        3 => 0.6,
+        _ => 0.1,
+    };
+
+    fill_score * 0.5 + spread_score * 0.5
+}
+
+fn find_interesting_attractor(rng: &mut Rng) -> FractalParams {
+    let mut best_params = FractalParams {
+        attractor_params: Some((1.7, 1.7, 0.6, 1.2)),
+        attractor_type: Some(AttractorType::Clifford),
+        samples: 20_000_000,
+        color_offset: rng.f64(),
+        ..Default::default()
+    };
+    let mut best_score = 0.0f64;
+
+    for _ in 0..80 {
+        let at = if rng.f64() < 0.5 {
+            AttractorType::Clifford
+        } else {
+            AttractorType::DeJong
+        };
+        let a = rng.range(-3.0, 3.0);
+        let b = rng.range(-3.0, 3.0);
+        let c = rng.range(-3.0, 3.0);
+        let d = rng.range(-3.0, 3.0);
+
+        let score = score_attractor_params(a, b, c, d, at);
+
+        if score > best_score {
+            best_score = score;
+            best_params = FractalParams {
+                attractor_params: Some((a, b, c, d)),
+                attractor_type: Some(at),
+                samples: 20_000_000,
+                color_offset: rng.f64(),
+                ..Default::default()
+            };
+        }
+
+        if best_score > 0.85 {
+            break;
+        }
+    }
+
+    best_params
+}
+
+// ── Buddhabrot ──────────────────────────────────────────────────────────────
+
+fn compute_buddhabrot(
+    width: u32, height: u32,
+    samples: u64,
+    r_iter: u32, g_iter: u32, b_iter: u32,
+    rng_seed: u64,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let hist_r = Histogram::new(width, height);
+    let hist_g = Histogram::new(width, height);
+    let hist_b = Histogram::new(width, height);
+
+    let num_threads = rayon::current_num_threads().max(1);
+    let samples_per_thread = samples / num_threads as u64;
+    let max_channel_iter = r_iter.max(g_iter).max(b_iter);
+
+    // The viewable region: centered on the Mandelbrot set, stretched for ultra-wide
+    let view_x_min = -2.5;
+    let view_x_max = 1.5;
+    let view_y_range = (view_x_max - view_x_min) / (width as f64 / height as f64);
+    let view_y_min = -view_y_range / 2.0;
+
+    (0..num_threads).into_par_iter().for_each(|tid| {
+        let mut rng = Rng::new(rng_seed.wrapping_add((tid as u64).wrapping_mul(0x9e3779b97f4a7c15)));
+        let mut orbit = Vec::with_capacity(max_channel_iter as usize);
+
+        for _ in 0..samples_per_thread {
+            let cr = rng.range(-2.0, 1.0);
+            let ci = rng.range(-1.5, 1.5);
+
+            // Check if point escapes
+            let mut zr = 0.0;
+            let mut zi = 0.0;
+            let mut escaped = false;
+
+            orbit.clear();
+            for i in 0..max_channel_iter {
+                let zr2 = zr * zr;
+                let zi2 = zi * zi;
+                if zr2 + zi2 > 4.0 {
+                    escaped = true;
+                    let _ = i;
+                    break;
+                }
+                orbit.push((zr, zi));
+                zi = 2.0 * zr * zi + ci;
+                zr = zr2 - zi2 + cr;
+            }
+
+            if !escaped { continue; }
+
+            // Accumulate orbit into histograms
+            for (i, &(ozr, ozi)) in orbit.iter().enumerate() {
+                let px = ((ozr - view_x_min) / (view_x_max - view_x_min) * width as f64) as i64;
+                let py = ((ozi - view_y_min) / view_y_range * height as f64) as i64;
+                if px >= 0 && px < width as i64 && py >= 0 && py < height as i64 {
+                    let ui = i as u32;
+                    if ui < b_iter {
+                        hist_b.increment(px as u32, py as u32);
+                    }
+                    if ui < g_iter {
+                        hist_g.increment(px as u32, py as u32);
+                    }
+                    if ui < r_iter {
+                        hist_r.increment(px as u32, py as u32);
+                    }
+                }
+            }
+        }
+    });
+
+    (hist_r.to_vec_f64(), hist_g.to_vec_f64(), hist_b.to_vec_f64())
+}
+
+fn render_buddhabrot(
+    r_data: &[f64], g_data: &[f64], b_data: &[f64],
+    width: u32, height: u32,
+) -> RgbImage {
+    // Use percentile-based normalization to avoid outlier domination,
+    // then gamma correction for brightness
+    let gamma = 0.4;
+
+    // Find 99.5th percentile for each channel to normalize against
+    let percentile_max = |data: &[f64]| -> f64 {
+        let mut sorted: Vec<f64> = data.iter().copied().filter(|&v| v > 0.0).collect();
+        if sorted.is_empty() { return 1.0; }
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let idx = (sorted.len() as f64 * 0.995) as usize;
+        sorted[idx.min(sorted.len() - 1)].max(1.0)
+    };
+    let r_norm = percentile_max(r_data);
+    let g_norm = percentile_max(g_data);
+    let b_norm = percentile_max(b_data);
+
+    let mut img = RgbImage::new(width, height);
+    for (i, ((r, g), b)) in r_data.iter().zip(g_data).zip(b_data).enumerate() {
+        let x = (i % width as usize) as u32;
+        let y = (i / width as usize) as u32;
+        if *r == 0.0 && *g == 0.0 && *b == 0.0 {
+            img.put_pixel(x, y, Rgb([0, 0, 0]));
+        } else {
+            img.put_pixel(x, y, Rgb([
+                ((*r / r_norm).min(1.0).powf(gamma) * 255.0) as u8,
+                ((*g / g_norm).min(1.0).powf(gamma) * 255.0) as u8,
+                ((*b / b_norm).min(1.0).powf(gamma) * 255.0) as u8,
+            ]));
+        }
+    }
+    img
+}
+
+fn find_interesting_buddhabrot(rng: &mut Rng) -> FractalParams {
+    // Buddhabrot always looks good — the main thing to vary is the iteration triple
+    let triples: [(u32, u32, u32); 6] = [
+        (5000, 500, 50),    // Classic nebula (red deep, blue shallow)
+        (2000, 200, 20),    // Softer, faster
+        (10000, 1000, 100), // Ultra-detailed
+        (500, 5000, 50),    // Green dominant
+        (50, 500, 5000),    // Blue dominant
+        (1000, 100, 1000),  // Purple (red+blue)
+    ];
+
+    let triple = rng.choose(&triples);
+
+    FractalParams {
+        buddhabrot_iters: Some(triple),
+        samples: 50_000_000,
+        color_offset: rng.f64(),
+        ..Default::default()
+    }
+}
+
+// ── Flame Fractals ──────────────────────────────────────────────────────────
+
+fn apply_variations(x: f64, y: f64, weights: &[f64; 10]) -> (f64, f64) {
+    let r2 = x * x + y * y;
+    let r = r2.sqrt();
+    let theta = y.atan2(x);
+    let mut vx = 0.0;
+    let mut vy = 0.0;
+
+    // V0: Linear
+    if weights[0] != 0.0 { vx += weights[0] * x; vy += weights[0] * y; }
+    // V1: Sinusoidal
+    if weights[1] != 0.0 { vx += weights[1] * x.sin(); vy += weights[1] * y.sin(); }
+    // V2: Spherical
+    if weights[2] != 0.0 {
+        let s = if r2 > 1e-10 { 1.0 / r2 } else { 1.0 };
+        vx += weights[2] * x * s;
+        vy += weights[2] * y * s;
+    }
+    // V3: Swirl
+    if weights[3] != 0.0 {
+        let sr = r2.sin();
+        let cr = r2.cos();
+        vx += weights[3] * (x * sr - y * cr);
+        vy += weights[3] * (x * cr + y * sr);
+    }
+    // V4: Horseshoe
+    if weights[4] != 0.0 {
+        let inv_r = if r > 1e-10 { 1.0 / r } else { 1.0 };
+        vx += weights[4] * inv_r * (x - y) * (x + y);
+        vy += weights[4] * inv_r * 2.0 * x * y;
+    }
+    // V5: Polar
+    if weights[5] != 0.0 {
+        vx += weights[5] * theta / std::f64::consts::PI;
+        vy += weights[5] * (r - 1.0);
+    }
+    // V6: Handkerchief
+    if weights[6] != 0.0 {
+        vx += weights[6] * r * (theta + r).sin();
+        vy += weights[6] * r * (theta - r).cos();
+    }
+    // V7: Heart
+    if weights[7] != 0.0 {
+        vx += weights[7] * r * (theta * r).sin();
+        vy += weights[7] * -r * (theta * r).cos();
+    }
+    // V8: Disc
+    if weights[8] != 0.0 {
+        let t = theta / std::f64::consts::PI;
+        let pr = std::f64::consts::PI * r;
+        vx += weights[8] * t * pr.sin();
+        vy += weights[8] * t * pr.cos();
+    }
+    // V9: Spiral
+    if weights[9] != 0.0 {
+        let inv_r = if r > 1e-10 { 1.0 / r } else { 1.0 };
+        vx += weights[9] * inv_r * (theta.cos() + r.sin());
+        vy += weights[9] * inv_r * (theta.sin() - r.cos());
+    }
+
+    (vx, vy)
+}
+
+fn compute_flame(
+    width: u32, height: u32,
+    transforms: &[FlameTransform],
+    samples: u64,
+    rng_seed: u64,
+) -> Vec<f64> {
+    // Pre-compute cumulative weights
+    let total_weight: f64 = transforms.iter().map(|t| t.weight).sum();
+    let cum_weights: Vec<f64> = transforms
+        .iter()
+        .scan(0.0, |acc, t| { *acc += t.weight / total_weight; Some(*acc) })
+        .collect();
+
+    let histogram = Histogram::new(width, height);
+    let num_threads = rayon::current_num_threads().max(1);
+    let samples_per_thread = samples / num_threads as u64;
+
+    (0..num_threads).into_par_iter().for_each(|tid| {
+        let mut rng = Rng::new(rng_seed.wrapping_add((tid as u64).wrapping_mul(0x9e3779b97f4a7c15)));
+        let mut x = rng.range(-1.0, 1.0);
+        let mut y = rng.range(-1.0, 1.0);
+
+        for i in 0..samples_per_thread {
+            // Select transform by weight
+            let r = rng.f64();
+            let mut chosen = 0;
+            for (j, &cw) in cum_weights.iter().enumerate() {
+                if r <= cw {
+                    chosen = j;
+                    break;
+                }
+            }
+            let t = &transforms[chosen];
+
+            // Apply affine transform
+            let ax = t.a * x + t.b * y + t.c;
+            let ay = t.d * x + t.e * y + t.f;
+
+            // Apply variation functions
+            let (vx, vy) = apply_variations(ax, ay, &t.variations);
+            x = vx;
+            y = vy;
+
+            // Divergence guard
+            if !x.is_finite() || !y.is_finite() || x.abs() > 1e10 || y.abs() > 1e10 {
+                x = rng.range(-1.0, 1.0);
+                y = rng.range(-1.0, 1.0);
+                continue;
+            }
+
+            if i < 20 { continue; } // Warmup
+
+            // Map to pixel — flame coordinates typically in [-2, 2]
+            let px = ((x + 2.5) / 5.0 * width as f64) as i64;
+            let py = ((y + 1.5) / 3.0 * height as f64) as i64;
+            if px >= 0 && px < width as i64 && py >= 0 && py < height as i64 {
+                histogram.increment(px as u32, py as u32);
+            }
+        }
+    });
+
+    tone_map_log(&histogram.to_vec_f64())
+}
+
+fn random_flame_transform(rng: &mut Rng) -> FlameTransform {
+    let mut variations = [0.0f64; 10];
+    // Pick 1-3 active variations
+    let n_active = rng.choose(&[1, 1, 2, 2, 3]);
+    for _ in 0..n_active {
+        let idx = (rng.next_u64() as usize) % 10;
+        variations[idx] = rng.range(0.2, 1.0);
+    }
+    // Normalize variation weights
+    let sum: f64 = variations.iter().sum();
+    if sum > 0.0 {
+        for v in &mut variations {
+            *v /= sum;
+        }
+    } else {
+        variations[0] = 1.0; // Fallback to linear
+    }
+
+    FlameTransform {
+        a: rng.range(-1.0, 1.0),
+        b: rng.range(-1.0, 1.0),
+        c: rng.range(-0.5, 0.5),
+        d: rng.range(-1.0, 1.0),
+        e: rng.range(-1.0, 1.0),
+        f: rng.range(-0.5, 0.5),
+        variations,
+        weight: rng.range(0.2, 1.0),
+        color: rng.f64(),
+    }
+}
+
+fn score_flame_params(transforms: &[FlameTransform], rng_seed: u64) -> f64 {
+    let probe_w: u32 = 272;
+    let probe_h: u32 = 72;
+    let probe_samples: u64 = 500_000;
+
+    let total_weight: f64 = transforms.iter().map(|t| t.weight).sum();
+    let cum_weights: Vec<f64> = transforms
+        .iter()
+        .scan(0.0, |acc, t| { *acc += t.weight / total_weight; Some(*acc) })
+        .collect();
+
+    let mut histogram = vec![0u32; probe_w as usize * probe_h as usize];
+    let mut rng = Rng::new(rng_seed);
+    let mut x = rng.range(-1.0, 1.0);
+    let mut y = rng.range(-1.0, 1.0);
+
+    for i in 0..probe_samples {
+        let r = rng.f64();
+        let mut chosen = 0;
+        for (j, &cw) in cum_weights.iter().enumerate() {
+            if r <= cw { chosen = j; break; }
+        }
+        let t = &transforms[chosen];
+        let ax = t.a * x + t.b * y + t.c;
+        let ay = t.d * x + t.e * y + t.f;
+        let (vx, vy) = apply_variations(ax, ay, &t.variations);
+        x = vx;
+        y = vy;
+
+        if !x.is_finite() || !y.is_finite() || x.abs() > 1e10 || y.abs() > 1e10 {
+            return 0.0; // Divergent
+        }
+
+        if i < 20 { continue; }
+
+        let px = ((x + 2.5) / 5.0 * probe_w as f64) as i64;
+        let py = ((y + 1.5) / 3.0 * probe_h as f64) as i64;
+        if px >= 0 && px < probe_w as i64 && py >= 0 && py < probe_h as i64 {
+            histogram[py as usize * probe_w as usize + px as usize] += 1;
+        }
+    }
+
+    let total = histogram.len();
+    let filled = histogram.iter().filter(|&&v| v > 0).count();
+    let fill_rate = filled as f64 / total as f64;
+
+    let fill_score = if fill_rate < 0.02 || fill_rate > 0.60 {
+        0.1
+    } else if fill_rate >= 0.05 && fill_rate <= 0.40 {
+        1.0
+    } else {
+        0.5
+    };
+
+    // Density variance — want structure, not uniform noise
+    let vals: Vec<f64> = histogram.iter().filter(|&&v| v > 0).map(|&v| v as f64).collect();
+    let density_score = if vals.is_empty() {
+        0.0
+    } else {
+        let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+        let variance = vals.iter().map(|&v| (v - mean) * (v - mean)).sum::<f64>() / vals.len() as f64;
+        let cv = variance.sqrt() / mean.max(1.0); // Coefficient of variation
+        (cv / 3.0).min(1.0) // High CV = structured, not uniform
+    };
+
+    // Spread check
+    let qw = probe_w as usize / 4;
+    let mut quarters_active = 0u32;
+    for q in 0..4 {
+        let mut q_filled = 0;
+        let mut q_total = 0;
+        for row in 0..probe_h as usize {
+            for col in (q * qw)..((q + 1) * qw) {
+                q_total += 1;
+                if histogram[row * probe_w as usize + col] > 0 {
+                    q_filled += 1;
+                }
+            }
+        }
+        if q_filled as f64 / q_total as f64 > 0.01 {
+            quarters_active += 1;
+        }
+    }
+    let spread_score = match quarters_active {
+        4 => 1.0,
+        3 => 0.6,
+        _ => 0.1,
+    };
+
+    fill_score * 0.35 + density_score * 0.35 + spread_score * 0.30
+}
+
+fn find_interesting_flame(rng: &mut Rng) -> FractalParams {
+    let mut best_transforms = vec![random_flame_transform(rng), random_flame_transform(rng)];
+    let mut best_score = 0.0f64;
+
+    for _ in 0..30 {
+        let n_transforms = rng.choose(&[2, 3, 3, 4, 5]);
+        let transforms: Vec<FlameTransform> = (0..n_transforms)
+            .map(|_| random_flame_transform(rng))
+            .collect();
+
+        let seed = rng.next_u64();
+        let score = score_flame_params(&transforms, seed);
+
+        if score > best_score {
+            best_score = score;
+            best_transforms = transforms;
+        }
+
+        if best_score > 0.80 {
+            break;
+        }
+    }
+
+    FractalParams {
+        flame_transforms: Some(best_transforms),
+        samples: 100_000_000,
+        color_offset: rng.f64(),
+        ..Default::default()
+    }
+}
+
 // ── Rendering ───────────────────────────────────────────────────────────────
 
-fn render(data: &[f64], width: u32, height: u32, palette: Palette, color_offset: f64) -> RgbImage {
+fn render(
+    data: &[f64], width: u32, height: u32, palette: Palette,
+    color_offset: f64, cycle_factor: f64,
+) -> RgbImage {
     let cmap = build_colormap(palette, 2048);
     let cmap_len = cmap.len();
     let offset = (color_offset * cmap_len as f64) as usize;
@@ -754,7 +1506,7 @@ fn render(data: &[f64], width: u32, height: u32, palette: Palette, color_offset:
                 [0, 0, 0]
             } else {
                 let normed = val / d_max;
-                let idx = ((normed * 12.0 * cmap_len as f64) as usize + offset) % cmap_len;
+                let idx = ((normed * cycle_factor * cmap_len as f64) as usize + offset) % cmap_len;
                 cmap[idx]
             }
         })
@@ -775,18 +1527,28 @@ fn generate(
     fractal: FractalType,
     palette: Palette,
     max_iter: u32,
+    samples: Option<u64>,
     output: Option<PathBuf>,
     rng: &mut Rng,
 ) {
+    let seed = rng.next_u64();
     let t_search = Instant::now();
-    let params = match fractal {
+    let mut params = match fractal {
         FractalType::Mandelbrot => find_interesting_mandelbrot(rng, max_iter),
         FractalType::Julia => find_interesting_julia(rng, max_iter),
         FractalType::BurningShip => find_interesting_burning_ship(rng, max_iter),
         FractalType::Newton => find_interesting_newton(rng, max_iter),
+        FractalType::Flame => find_interesting_flame(rng),
+        FractalType::Buddhabrot => find_interesting_buddhabrot(rng),
+        FractalType::StrangeAttractor => find_interesting_attractor(rng),
         FractalType::All => unreachable!(),
     };
     let search_time = t_search.elapsed();
+
+    // Override samples if provided via CLI
+    if let Some(s) = samples {
+        params.samples = s;
+    }
 
     let out_path = output.unwrap_or_else(|| {
         PathBuf::from(format!("fractal_{fractal}_{palette}_{WIDTH}x{HEIGHT}.png"))
@@ -796,34 +1558,50 @@ fn generate(
         "Generating {fractal} ({WIDTH}x{HEIGHT}, palette={palette}, max_iter={max_iter})"
     );
     println!(
-        "  Found interesting view in {:.2}s: center=({:.10}, {:.10}), zoom={:.1}",
-        search_time.as_secs_f64(), params.center.0, params.center.1, params.zoom
+        "  Found interesting params in {:.2}s",
+        search_time.as_secs_f64(),
     );
-    if let Some(c) = params.julia_c {
-        println!("  julia c=({:.10}, {:.10})", c.0, c.1);
-    }
 
     let t0 = Instant::now();
-    let data = match fractal {
+    let img = match fractal {
         FractalType::Mandelbrot => {
-            compute_mandelbrot(WIDTH, HEIGHT, params.center, params.zoom, max_iter)
+            let data = compute_mandelbrot(WIDTH, HEIGHT, params.center, params.zoom, max_iter);
+            render(&data, WIDTH, HEIGHT, palette, params.color_offset, 12.0)
         }
         FractalType::Julia => {
             let c = params.julia_c.unwrap();
-            compute_julia(WIDTH, HEIGHT, c, params.zoom, max_iter)
+            let data = compute_julia(WIDTH, HEIGHT, c, params.zoom, max_iter);
+            render(&data, WIDTH, HEIGHT, palette, params.color_offset, 12.0)
         }
         FractalType::BurningShip => {
-            compute_burning_ship(WIDTH, HEIGHT, params.center, params.zoom, max_iter)
+            let data = compute_burning_ship(WIDTH, HEIGHT, params.center, params.zoom, max_iter);
+            render(&data, WIDTH, HEIGHT, palette, params.color_offset, 12.0)
         }
         FractalType::Newton => {
-            compute_newton(WIDTH, HEIGHT, params.center, params.zoom, max_iter.min(500))
+            let data = compute_newton(WIDTH, HEIGHT, params.center, params.zoom, max_iter.min(500));
+            render(&data, WIDTH, HEIGHT, palette, params.color_offset, 12.0)
+        }
+        FractalType::StrangeAttractor => {
+            let (a, b, c, d) = params.attractor_params.unwrap();
+            let at = params.attractor_type.unwrap();
+            let data = compute_attractor(WIDTH, HEIGHT, a, b, c, d, at, params.samples, seed);
+            render(&data, WIDTH, HEIGHT, palette, params.color_offset, 2.0)
+        }
+        FractalType::Buddhabrot => {
+            let (ri, gi, bi) = params.buddhabrot_iters.unwrap();
+            let (r, g, b) = compute_buddhabrot(WIDTH, HEIGHT, params.samples, ri, gi, bi, seed);
+            render_buddhabrot(&r, &g, &b, WIDTH, HEIGHT)
+        }
+        FractalType::Flame => {
+            let transforms = params.flame_transforms.as_ref().unwrap();
+            let data = compute_flame(WIDTH, HEIGHT, transforms, params.samples, seed);
+            render(&data, WIDTH, HEIGHT, palette, params.color_offset, 2.0)
         }
         FractalType::All => unreachable!(),
     };
     let t1 = Instant::now();
     println!("  Computed in {:.2}s", (t1 - t0).as_secs_f64());
 
-    let img = render(&data, WIDTH, HEIGHT, palette, params.color_offset);
     img.save(&out_path).expect("Failed to save image");
     let t2 = Instant::now();
     println!(
@@ -852,15 +1630,18 @@ fn main() {
                 FractalType::Julia,
                 FractalType::BurningShip,
                 FractalType::Newton,
+                FractalType::StrangeAttractor,
+                FractalType::Buddhabrot,
+                FractalType::Flame,
             ];
             for ft in types {
                 let pal = cli.palette.unwrap_or_else(|| rng.choose(&ALL_PALETTES));
-                generate(ft, pal, cli.max_iter, None, &mut rng);
+                generate(ft, pal, cli.max_iter, cli.samples, None, &mut rng);
             }
         }
         ft => {
             let pal = cli.palette.unwrap_or_else(|| rng.choose(&ALL_PALETTES));
-            generate(ft, pal, cli.max_iter, cli.output, &mut rng);
+            generate(ft, pal, cli.max_iter, cli.samples, cli.output, &mut rng);
         }
     }
 }
