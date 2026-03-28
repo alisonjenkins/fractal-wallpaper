@@ -264,7 +264,27 @@ fn tone_map_log(histogram: &[f64]) -> Vec<f64> {
 
 // ── Single-point iteration functions (for probing) ──────────────────────────
 
+/// Check if point is inside the main cardioid or period-2 bulb.
+/// These points never escape, so we can skip iteration entirely.
+#[inline(always)]
+fn in_cardioid_or_bulb(cr: f64, ci: f64) -> bool {
+    let ci2 = ci * ci;
+    // Main cardioid: |(c - 1/4)| < 1/2 * (1 - cos(theta))
+    let q = (cr - 0.25) * (cr - 0.25) + ci2;
+    if q * (q + (cr - 0.25)) <= 0.25 * ci2 {
+        return true;
+    }
+    // Period-2 bulb: |(c + 1)| < 1/4
+    if (cr + 1.0) * (cr + 1.0) + ci2 <= 0.0625 {
+        return true;
+    }
+    false
+}
+
 fn iterate_mandelbrot(cr: f64, ci: f64, max_iter: u32) -> f64 {
+    if in_cardioid_or_bulb(cr, ci) {
+        return 0.0;
+    }
     let mut zr = 0.0;
     let mut zi = 0.0;
     let mut i = 0u32;
@@ -680,10 +700,24 @@ fn find_interesting_newton(rng: &mut Rng, _max_iter: u32) -> FractalParams {
 /// SIMD smooth iteration for 4 Mandelbrot pixels at once.
 /// Returns array of smooth iteration counts (0.0 = inside set).
 fn iterate_mandelbrot_4x(cr: f64x4, ci: f64x4, max_iter: u32) -> [f64; 4] {
+    // Pre-check cardioid/bulb for each lane
+    let cr_arr: [f64; 4] = bytemuck::cast(cr);
+    let ci_arr: [f64; 4] = bytemuck::cast(ci);
+    let mut result = [0.0f64; 4];
+    let mut all_skip = true;
+    let mut done = [false; 4];
+    for k in 0..4 {
+        if in_cardioid_or_bulb(cr_arr[k], ci_arr[k]) {
+            done[k] = true;
+        } else {
+            all_skip = false;
+        }
+    }
+    if all_skip { return result; }
+
     let mut zr = f64x4::ZERO;
     let mut zi = f64x4::ZERO;
     let mut counts = [0u32; 4];
-    let mut done = [false; 4];
     let threshold = f64x4::splat(65536.0);
     let two = f64x4::splat(2.0);
 
@@ -717,11 +751,10 @@ fn iterate_mandelbrot_4x(cr: f64x4, ci: f64x4, max_iter: u32) -> [f64; 4] {
         zi = new_zi;
     }
 
-    // Compute smooth coloring
+    // Compute smooth coloring (only for lanes that escaped, not cardioid-skipped)
     let mag2_arr: [f64; 4] = bytemuck::cast(zr * zr + zi * zi);
-    let mut result = [0.0f64; 4];
     for k in 0..4 {
-        if done[k] {
+        if done[k] && counts[k] > 0 {
             let mag = mag2_arr[k].sqrt();
             result[k] = counts[k] as f64 + 1.0 - mag.ln().ln() / std::f64::consts::LN_2;
         }
