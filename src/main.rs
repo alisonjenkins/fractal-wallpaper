@@ -1503,12 +1503,14 @@ fn apply_variations(x: f64, y: f64, weights: &[f64; 10]) -> (f64, f64) {
     (vx, vy)
 }
 
+/// Compute flame fractal, returning (density, color_index) per pixel.
+/// Color index is the average transform color at each pixel.
 fn compute_flame(
     width: u32, height: u32,
     transforms: &[FlameTransform],
     samples: u64,
     rng_seed: u64,
-) -> Vec<f64> {
+) -> (Vec<f64>, Vec<f64>) {
     // Pre-compute cumulative weights
     let total_weight: f64 = transforms.iter().map(|t| t.weight).sum();
     let cum_weights: Vec<f64> = transforms
@@ -1516,7 +1518,10 @@ fn compute_flame(
         .scan(0.0, |acc, t| { *acc += t.weight / total_weight; Some(*acc) })
         .collect();
 
+    let n = (width as usize) * (height as usize);
     let histogram = Histogram::new(width, height);
+    // Accumulate color indices using atomic u64 (fixed-point: value * 1_000_000)
+    let color_acc: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
     let num_threads = rayon::current_num_threads().max(1);
     let samples_per_thread = samples / num_threads as u64;
 
@@ -1524,6 +1529,7 @@ fn compute_flame(
         let mut rng = Rng::new(rng_seed.wrapping_add((tid as u64).wrapping_mul(0x9e3779b97f4a7c15)));
         let mut x = rng.range(-1.0, 1.0);
         let mut y = rng.range(-1.0, 1.0);
+        let mut color_idx = 0.5f64;
 
         for i in 0..samples_per_thread {
             // Select transform by weight
@@ -1546,10 +1552,14 @@ fn compute_flame(
             x = vx;
             y = vy;
 
+            // Blend color index with transform's color
+            color_idx = (color_idx + t.color) / 2.0;
+
             // Divergence guard
             if !x.is_finite() || !y.is_finite() || x.abs() > 1e10 || y.abs() > 1e10 {
                 x = rng.range(-1.0, 1.0);
                 y = rng.range(-1.0, 1.0);
+                color_idx = 0.5;
                 continue;
             }
 
@@ -1559,12 +1569,70 @@ fn compute_flame(
             let px = ((x + 2.5) / 5.0 * width as f64) as i64;
             let py = ((y + 1.5) / 3.0 * height as f64) as i64;
             if px >= 0 && px < width as i64 && py >= 0 && py < height as i64 {
+                let idx = py as usize * width as usize + px as usize;
                 histogram.increment(px as u32, py as u32);
+                // Fixed-point color accumulation
+                color_acc[idx].fetch_add((color_idx * 1_000_000.0) as u64, Ordering::Relaxed);
             }
         }
     });
 
-    tone_map_log(&histogram.to_vec_f64())
+    let density = tone_map_log(&histogram.to_vec_f64());
+    let raw_density = histogram.to_vec_f64();
+
+    // Compute average color index per pixel
+    let color_map: Vec<f64> = color_acc
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let count = raw_density[i];
+            if count > 0.0 {
+                (c.load(Ordering::Relaxed) as f64 / 1_000_000.0) / count
+            } else {
+                0.0
+            }
+        })
+        .collect();
+
+    (density, color_map)
+}
+
+/// Render flame fractal with per-pixel color blending from the palette.
+fn render_flame(
+    density: &[f64], color_map: &[f64],
+    width: u32, height: u32,
+    palette: Palette, color_offset: f64,
+) -> RgbImage {
+    let cmap = build_colormap(palette, 2048);
+    let cmap_len = cmap.len();
+    let offset = (color_offset * cmap_len as f64) as usize;
+
+    let d_max = density
+        .iter()
+        .copied()
+        .filter(|&v| v > 0.0)
+        .fold(0.0f64, f64::max)
+        .max(1.0);
+
+    let mut img = RgbImage::new(width, height);
+    for (i, (&d, &c)) in density.iter().zip(color_map.iter()).enumerate() {
+        let x = (i % width as usize) as u32;
+        let y = (i / width as usize) as u32;
+        if d == 0.0 {
+            img.put_pixel(x, y, Rgb([0, 0, 0]));
+        } else {
+            // Use color index to select palette position, brightness from density
+            let brightness = (d / d_max).powf(0.5); // Gamma for visibility
+            let color_idx = ((c * cmap_len as f64) as usize + offset) % cmap_len;
+            let base = cmap[color_idx];
+            img.put_pixel(x, y, Rgb([
+                (base[0] as f64 * brightness).min(255.0) as u8,
+                (base[1] as f64 * brightness).min(255.0) as u8,
+                (base[2] as f64 * brightness).min(255.0) as u8,
+            ]));
+        }
+    }
+    img
 }
 
 fn random_flame_transform(rng: &mut Rng) -> FlameTransform {
@@ -1835,8 +1903,8 @@ fn generate(
         }
         FractalType::Flame => {
             let transforms = params.flame_transforms.as_ref().unwrap();
-            let data = compute_flame(width, height, transforms, params.samples, seed);
-            render(&data, width, height, palette, params.color_offset, 2.0)
+            let (density, color_map) = compute_flame(width, height, transforms, params.samples, seed);
+            render_flame(&density, &color_map, width, height, palette, params.color_offset)
         }
         FractalType::All => unreachable!(),
     };
