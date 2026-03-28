@@ -115,6 +115,8 @@ enum FractalType {
     Flame,
     Buddhabrot,
     StrangeAttractor,
+    Tricorn,
+    Phoenix,
     All,
 }
 
@@ -144,6 +146,8 @@ impl std::fmt::Display for FractalType {
             Self::Flame => write!(f, "flame"),
             Self::Buddhabrot => write!(f, "buddhabrot"),
             Self::StrangeAttractor => write!(f, "strange-attractor"),
+            Self::Tricorn => write!(f, "tricorn"),
+            Self::Phoenix => write!(f, "phoenix"),
             Self::All => write!(f, "all"),
         }
     }
@@ -356,6 +360,60 @@ fn iterate_burning_ship(cr: f64, ci: f64, max_iter: u32) -> f64 {
         }
         zi = 2.0 * azr * azi + ci;
         zr = zr2 - zi2 + cr;
+        i += 1;
+    }
+    if i < max_iter {
+        let mag = (zr * zr + zi * zi).sqrt();
+        i as f64 + 1.0 - mag.ln().ln() / std::f64::consts::LN_2
+    } else {
+        0.0
+    }
+}
+
+fn iterate_tricorn(cr: f64, ci: f64, max_iter: u32) -> f64 {
+    // Tricorn/Mandelbar: z = conj(z)^2 + c
+    let mut zr = 0.0;
+    let mut zi = 0.0;
+    let mut i = 0u32;
+    while i < max_iter {
+        let zr2 = zr * zr;
+        let zi2 = zi * zi;
+        if zr2 + zi2 > 65536.0 {
+            break;
+        }
+        // conj(z)^2 = (zr - zi*i)^2 = zr^2 - zi^2 - 2*zr*zi*i
+        let new_zr = zr2 - zi2 + cr;
+        zi = -2.0 * zr * zi + ci; // Note: negative sign (conjugate)
+        zr = new_zr;
+        i += 1;
+    }
+    if i < max_iter {
+        let mag = (zr * zr + zi * zi).sqrt();
+        i as f64 + 1.0 - mag.ln().ln() / std::f64::consts::LN_2
+    } else {
+        0.0
+    }
+}
+
+fn iterate_phoenix(zr0: f64, zi0: f64, cr: f64, ci: f64, max_iter: u32) -> f64 {
+    // Phoenix fractal: z_n+1 = z_n^2 + Re(c) + Im(c)*z_n-1
+    let mut zr = zr0;
+    let mut zi = zi0;
+    let mut zr_prev = 0.0;
+    let mut zi_prev = 0.0;
+    let mut i = 0u32;
+    while i < max_iter {
+        let zr2 = zr * zr;
+        let zi2 = zi * zi;
+        if zr2 + zi2 > 65536.0 {
+            break;
+        }
+        let new_zr = zr2 - zi2 + cr + ci * zr_prev;
+        let new_zi = 2.0 * zr * zi + ci * zi_prev;
+        zr_prev = zr;
+        zi_prev = zi;
+        zr = new_zr;
+        zi = new_zi;
         i += 1;
     }
     if i < max_iter {
@@ -1069,6 +1127,167 @@ fn compute_newton(
             }
         });
     result
+}
+
+// ── Tricorn / Mandelbar ─────────────────────────────────────────────────────
+
+fn compute_tricorn(
+    width: u32, height: u32,
+    center: (f64, f64), zoom: f64, max_iter: u32,
+) -> Vec<f64> {
+    let w = width as usize;
+    let h = height as usize;
+    let aspect = width as f64 / height as f64;
+    let x_range = 3.5 / zoom;
+    let y_range = x_range / aspect;
+    let x_min = center.0 - x_range / 2.0;
+    let y_min = center.1 - y_range / 2.0;
+    let x_step = x_range / width as f64;
+    let y_step = y_range / height as f64;
+
+    let mut result = vec![0.0f64; w * h];
+    result
+        .par_chunks_mut(w)
+        .enumerate()
+        .for_each(|(py, row)| {
+            let ci = y_min + py as f64 * y_step;
+            for px in 0..w {
+                let cr = x_min + px as f64 * x_step;
+                row[px] = iterate_tricorn(cr, ci, max_iter);
+            }
+        });
+    result
+}
+
+fn find_interesting_tricorn(rng: &mut Rng, max_iter: u32, width: u32, height: u32) -> FractalParams {
+    // Tricorn boundary is similar to Mandelbrot but with 3-fold symmetry
+    let mut best_params = FractalParams {
+        center: (-0.3, 0.0),
+        color_offset: rng.f64(),
+        ..Default::default()
+    };
+    let mut best_score = 0.0f64;
+
+    for _ in 0..80 {
+        let angle = rng.range(0.0, std::f64::consts::TAU);
+        let ray_len = 2.5;
+        let outside = (ray_len * angle.cos(), ray_len * angle.sin());
+        // Use a known inside point for Tricorn
+        let inside_pt = (-0.2, 0.0);
+
+        // Binary search for the Tricorn boundary
+        let mut or = outside.0;
+        let mut oi = outside.1;
+        let mut ir = inside_pt.0;
+        let mut ii = inside_pt.1;
+        for _ in 0..64 {
+            let mr = (or + ir) / 2.0;
+            let mi = (oi + ii) / 2.0;
+            if iterate_tricorn(mr, mi, max_iter) == 0.0 {
+                ir = mr; ii = mi;
+            } else {
+                or = mr; oi = mi;
+            }
+        }
+        let boundary = ((or + ir) / 2.0, (oi + ii) / 2.0);
+
+        let zoom = 10.0f64.powf(rng.range(1.0, 3.5));
+        let score = score_viewport(
+            boundary, zoom, max_iter,
+            &|x, y, mi| iterate_tricorn(x, y, mi),
+            width, height,
+        );
+
+        if score > best_score {
+            best_score = score;
+            best_params = FractalParams {
+                center: boundary,
+                zoom,
+                color_offset: rng.f64(),
+                ..Default::default()
+            };
+        }
+        if best_score > 0.80 { break; }
+    }
+    best_params
+}
+
+// ── Phoenix Fractal ─────────────────────────────────────────────────────────
+
+fn compute_phoenix(
+    width: u32, height: u32,
+    c: (f64, f64), zoom: f64, max_iter: u32,
+) -> Vec<f64> {
+    let w = width as usize;
+    let h = height as usize;
+    let aspect = width as f64 / height as f64;
+    let x_range = 3.5 / zoom;
+    let y_range = x_range / aspect;
+    let x_min = -x_range / 2.0;
+    let y_min = -y_range / 2.0;
+    let x_step = x_range / width as f64;
+    let y_step = y_range / height as f64;
+
+    let mut result = vec![0.0f64; w * h];
+    result
+        .par_chunks_mut(w)
+        .enumerate()
+        .for_each(|(py, row)| {
+            for px in 0..w {
+                let zr = x_min + px as f64 * x_step;
+                let zi = y_min + py as f64 * y_step;
+                row[px] = iterate_phoenix(zr, zi, c.0, c.1, max_iter);
+            }
+        });
+    result
+}
+
+fn find_interesting_phoenix(rng: &mut Rng, max_iter: u32, width: u32, height: u32) -> FractalParams {
+    // Curated Phoenix constants known to produce interesting patterns
+    let constants: [(f64, f64); 8] = [
+        (0.5667, -0.5),
+        (0.2, -0.5),
+        (-0.5, 0.0),
+        (0.56667, -0.5),
+        (0.4, -0.3),
+        (-0.4, 0.1),
+        (0.3, -0.4),
+        (0.56, -0.45),
+    ];
+
+    let mut best_params = FractalParams {
+        julia_c: Some(constants[0]),
+        color_offset: rng.f64(),
+        ..Default::default()
+    };
+    let mut best_score = 0.0f64;
+
+    for _ in 0..50 {
+        let (cr, ci) = rng.choose(&constants);
+        let c = (
+            cr + rng.range(-0.05, 0.05),
+            ci + rng.range(-0.05, 0.05),
+        );
+        let zoom = 10.0f64.powf(rng.range(0.0, 1.2));
+
+        let score = score_viewport(
+            (0.0, 0.0), zoom, max_iter,
+            &|x, y, mi| iterate_phoenix(x, y, c.0, c.1, mi),
+            width, height,
+        );
+
+        if score > best_score {
+            best_score = score;
+            best_params = FractalParams {
+                zoom,
+                julia_c: Some(c),
+                color_offset: rng.f64(),
+                ..Default::default()
+            };
+        }
+        if best_score > 0.80 { break; }
+    }
+    best_params
 }
 
 // ── Strange Attractor ───────────────────────────────────────────────────────
@@ -1906,6 +2125,8 @@ fn generate(
         FractalType::Julia => find_interesting_julia(rng, max_iter, width, height),
         FractalType::BurningShip => find_interesting_burning_ship(rng, max_iter, width, height),
         FractalType::Newton => find_interesting_newton(rng, max_iter),
+        FractalType::Tricorn => find_interesting_tricorn(rng, max_iter, width, height),
+        FractalType::Phoenix => find_interesting_phoenix(rng, max_iter, width, height),
         FractalType::Flame => find_interesting_flame(rng),
         FractalType::Buddhabrot => find_interesting_buddhabrot(rng),
         FractalType::StrangeAttractor => find_interesting_attractor(rng),
@@ -1975,6 +2196,15 @@ fn generate(
         }
         FractalType::Newton => {
             let data = compute_newton(render_w, render_h, params.center, params.zoom, max_iter.min(500));
+            render(&data, render_w, render_h, palette, params.color_offset, 12.0)
+        }
+        FractalType::Tricorn => {
+            let data = compute_tricorn(render_w, render_h, params.center, params.zoom, max_iter);
+            render(&data, render_w, render_h, palette, params.color_offset, 12.0)
+        }
+        FractalType::Phoenix => {
+            let c = params.julia_c.unwrap();
+            let data = compute_phoenix(render_w, render_h, c, params.zoom, max_iter);
             render(&data, render_w, render_h, palette, params.color_offset, 12.0)
         }
         FractalType::StrangeAttractor => {
@@ -2054,6 +2284,15 @@ fn main() {
                 let data = compute_newton(render_w, render_h, saved.params.center, saved.params.zoom, saved.max_iter.min(500));
                 render(&data, render_w, render_h, saved.palette, saved.params.color_offset, 12.0)
             }
+            FractalType::Tricorn => {
+                let data = compute_tricorn(render_w, render_h, saved.params.center, saved.params.zoom, saved.max_iter);
+                render(&data, render_w, render_h, saved.palette, saved.params.color_offset, 12.0)
+            }
+            FractalType::Phoenix => {
+                let c = saved.params.julia_c.unwrap();
+                let data = compute_phoenix(render_w, render_h, c, saved.params.zoom, saved.max_iter);
+                render(&data, render_w, render_h, saved.palette, saved.params.color_offset, 12.0)
+            }
             FractalType::StrangeAttractor => {
                 let (a, b, c, d) = saved.params.attractor_params.unwrap();
                 let at = saved.params.attractor_type.unwrap();
@@ -2097,6 +2336,8 @@ fn main() {
                 FractalType::Julia,
                 FractalType::BurningShip,
                 FractalType::Newton,
+                FractalType::Tricorn,
+                FractalType::Phoenix,
                 FractalType::StrangeAttractor,
                 FractalType::Buddhabrot,
                 FractalType::Flame,
