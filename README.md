@@ -1,8 +1,8 @@
 # fractal-wallpaper
 
-A fast, SIMD-accelerated fractal wallpaper generator written in Rust. Produces unique, visually rich wallpapers at any resolution with 9 fractal types, 12+ color palettes, and a color-theory random palette generator.
+A fast, SIMD-accelerated fractal wallpaper generator written in Rust. Available as both a CLI tool and a Rust library for integration into your own applications.
 
-Default resolution is 5440x1440 (ultra-wide dual monitor), but any resolution is supported via `--width` and `--height`.
+Produces unique, visually rich wallpapers at any resolution with 9 fractal types, 12+ color palettes, and a color-theory random palette generator. Default resolution is 5440x1440 (ultra-wide dual monitor).
 
 ## Quick Start
 
@@ -132,6 +132,91 @@ fractal-wallpaper [OPTIONS] [FRACTAL]
 # Reproducible output with a fixed seed
 ./target/release/fractal-wallpaper mandelbrot --seed 42 -p twilight
 ```
+
+## Library Usage
+
+The crate can be used as a Rust library for generating fractals programmatically — useful for building APIs, web services, or batch generators.
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+fractal-wallpaper = { git = "https://github.com/alisonjenkins/fractal-wallpaper" }
+```
+
+### Basic Example
+
+```rust
+use fractal_wallpaper::*;
+
+fn main() {
+    let mut rng = Rng::new(42);
+
+    // Find visually interesting parameters
+    let params = find_interesting_params(
+        FractalType::Mandelbrot, 1920, 1080, 1500, &mut rng,
+    );
+
+    // Resolve palette to color anchors
+    let anchors = resolve_palette(Palette::Sakura, &mut rng);
+
+    // Generate the image (returns image::RgbImage)
+    let img = generate(
+        FractalType::Mandelbrot, &params, 1920, 1080, 1500, &anchors, 1,
+    );
+
+    img.save("wallpaper.png").unwrap();
+}
+```
+
+### API Overview
+
+| Function | Description |
+|----------|-------------|
+| `find_interesting_params()` | Find visually rich parameters for any fractal type |
+| `generate()` | Render a fractal image from parameters — returns `RgbImage` |
+| `resolve_palette()` | Convert a `Palette` enum to concrete `[R,G,B]` color anchors |
+| `generate_random_palette()` | Create a unique color-theory palette |
+| `palette_anchors()` | Get the anchor colors for a preset palette |
+| `downsample()` | Anti-alias an image by averaging NxN pixel blocks |
+
+### Lower-Level API
+
+For more control, use the compute and render functions directly:
+
+```rust
+use fractal_wallpaper::*;
+
+// Compute raw iteration data
+let data = compute_mandelbrot(1920, 1080, (-0.75, 0.1), 500.0, 2000);
+
+// Render with custom anchors and color cycling
+let anchors = palette_anchors(Palette::Neon);
+let img = render(&data, 1920, 1080, &anchors, 0.0, 12.0);
+
+img.save("custom.png").unwrap();
+```
+
+Available compute functions: `compute_mandelbrot`, `compute_julia`, `compute_burning_ship`, `compute_newton`, `compute_tricorn`, `compute_phoenix`, `compute_attractor`, `compute_buddhabrot`, `compute_flame`.
+
+### Key Types
+
+| Type | Description |
+|------|-------------|
+| `Rng` | Deterministic PRNG (xoshiro256**) — seed for reproducibility |
+| `FractalType` | Enum of all 9 fractal types |
+| `Palette` | Enum of all preset palettes + `Random` |
+| `FractalParams` | All parameters needed to reproduce a fractal (serializable) |
+| `SavedParams` | Complete snapshot including fractal type, palette, and params |
+| `RgbImage` | Re-exported from the `image` crate |
+
+`FractalParams` and `SavedParams` implement `Serialize`/`Deserialize` for JSON persistence.
+
+### Constants
+
+- `ALL_FRACTAL_TYPES: &[FractalType]` — all 9 fractal types for iteration
+- `ALL_PALETTES: &[Palette]` — all 12 palette presets (including Random)
+- `DEFAULT_WIDTH` / `DEFAULT_HEIGHT` — 5440 / 1440
 
 ## How It Works
 
