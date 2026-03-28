@@ -1576,9 +1576,25 @@ fn compute_buddhabrot(
         let mut rng = Rng::new(rng_seed.wrapping_add((tid as u64).wrapping_mul(0x9e3779b97f4a7c15)));
         let mut orbit = Vec::with_capacity(max_channel_iter as usize);
 
-        for _ in 0..samples_per_thread {
-            let cr = rng.range(-2.0, 1.0);
-            let ci = rng.range(-1.5, 1.5);
+        // Metropolis-Hastings: start from a known escaping point near the boundary
+        let mut cur_cr = -0.75;
+        let mut cur_ci = 0.1;
+        let step_size = 0.01;
+
+        for sample_idx in 0..samples_per_thread {
+            // Propose a new point (random walk from current, or uniform random every 100 steps)
+            let (cr, ci) = if sample_idx % 100 == 0 {
+                // Periodic uniform random to avoid getting stuck
+                (rng.range(-2.0, 1.0), rng.range(-1.5, 1.5))
+            } else {
+                (
+                    cur_cr + rng.range(-step_size, step_size),
+                    cur_ci + rng.range(-step_size, step_size),
+                )
+            };
+
+            // Skip points known to be inside the cardioid/bulb
+            if in_cardioid_or_bulb(cr, ci) { continue; }
 
             // Check if point escapes
             let mut zr = 0.0;
@@ -1586,12 +1602,11 @@ fn compute_buddhabrot(
             let mut escaped = false;
 
             orbit.clear();
-            for i in 0..max_channel_iter {
+            for _ in 0..max_channel_iter {
                 let zr2 = zr * zr;
                 let zi2 = zi * zi;
                 if zr2 + zi2 > 4.0 {
                     escaped = true;
-                    let _ = i;
                     break;
                 }
                 orbit.push((zr, zi));
@@ -1600,6 +1615,10 @@ fn compute_buddhabrot(
             }
 
             if !escaped { continue; }
+
+            // Accept the proposed point for future random walks
+            cur_cr = cr;
+            cur_ci = ci;
 
             // Accumulate orbit into histograms
             for (i, &(ozr, ozi)) in orbit.iter().enumerate() {
