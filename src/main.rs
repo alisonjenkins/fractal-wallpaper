@@ -195,7 +195,204 @@ fn build_colormap(palette: Palette, n: usize) -> Vec<[u8; 3]> {
         .collect()
 }
 
-// ── Randomized Parameter Generation ─────────────────────────────────────────
+// ── Single-point iteration functions (for probing) ──────────────────────────
+
+fn iterate_mandelbrot(cr: f64, ci: f64, max_iter: u32) -> f64 {
+    let mut zr = 0.0;
+    let mut zi = 0.0;
+    let mut i = 0u32;
+    while i < max_iter {
+        let zr2 = zr * zr;
+        let zi2 = zi * zi;
+        if zr2 + zi2 > 65536.0 {
+            break;
+        }
+        zi = 2.0 * zr * zi + ci;
+        zr = zr2 - zi2 + cr;
+        i += 1;
+    }
+    if i < max_iter {
+        let mag = (zr * zr + zi * zi).sqrt();
+        i as f64 + 1.0 - mag.ln().ln() / std::f64::consts::LN_2
+    } else {
+        0.0
+    }
+}
+
+fn iterate_julia(zr0: f64, zi0: f64, cr: f64, ci: f64, max_iter: u32) -> f64 {
+    let mut zr = zr0;
+    let mut zi = zi0;
+    let mut i = 0u32;
+    while i < max_iter {
+        let zr2 = zr * zr;
+        let zi2 = zi * zi;
+        if zr2 + zi2 > 65536.0 {
+            break;
+        }
+        let new_zr = zr2 - zi2 + cr;
+        zi = 2.0 * zr * zi + ci;
+        zr = new_zr;
+        i += 1;
+    }
+    if i < max_iter {
+        let mag = (zr * zr + zi * zi).sqrt();
+        i as f64 + 1.0 - mag.ln().ln() / std::f64::consts::LN_2
+    } else {
+        0.0
+    }
+}
+
+fn iterate_burning_ship(cr: f64, ci: f64, max_iter: u32) -> f64 {
+    let mut zr: f64 = 0.0;
+    let mut zi: f64 = 0.0;
+    let mut i = 0u32;
+    while i < max_iter {
+        let azr = zr.abs();
+        let azi = zi.abs();
+        let zr2 = azr * azr;
+        let zi2 = azi * azi;
+        if zr2 + zi2 > 65536.0 {
+            break;
+        }
+        zi = 2.0 * azr * azi + ci;
+        zr = zr2 - zi2 + cr;
+        i += 1;
+    }
+    if i < max_iter {
+        let mag = (zr * zr + zi * zi).sqrt();
+        i as f64 + 1.0 - mag.ln().ln() / std::f64::consts::LN_2
+    } else {
+        0.0
+    }
+}
+
+// ── Boundary-finding: locate interesting points ─────────────────────────────
+
+/// Find a point on the boundary of the Mandelbrot set by binary search.
+/// Start from a point known to be outside, search toward a point inside.
+fn find_boundary_point(
+    outside: (f64, f64),
+    inside: (f64, f64),
+    max_iter: u32,
+) -> (f64, f64) {
+    let mut or = outside.0;
+    let mut oi = outside.1;
+    let mut ir = inside.0;
+    let mut ii = inside.1;
+
+    for _ in 0..64 {
+        let mr = (or + ir) / 2.0;
+        let mi = (oi + ii) / 2.0;
+        let val = iterate_mandelbrot(mr, mi, max_iter);
+        if val == 0.0 {
+            // Inside set — move inside point to midpoint
+            ir = mr;
+            ii = mi;
+        } else {
+            // Outside set — move outside point to midpoint
+            or = mr;
+            oi = mi;
+        }
+    }
+    ((or + ir) / 2.0, (oi + ii) / 2.0)
+}
+
+/// Probe a viewport with spatial awareness.
+/// Returns a score from 0.0 (boring) to 1.0 (visually rich).
+/// Checks that detail is spread across the full width, not clustered.
+fn score_viewport(
+    center: (f64, f64),
+    zoom: f64,
+    max_iter: u32,
+    iterate_fn: &dyn Fn(f64, f64, u32) -> f64,
+) -> f64 {
+    let aspect = WIDTH as f64 / HEIGHT as f64;
+    let x_range = 3.5 / zoom;
+    let y_range = x_range / aspect;
+    let x_min = center.0 - x_range / 2.0;
+    let y_min = center.1 - y_range / 2.0;
+
+    let sx = 48; // More horizontal samples for ultra-wide
+    let sy = 16;
+    let mut values = vec![0.0f64; sx * sy];
+
+    for row in 0..sy {
+        for col in 0..sx {
+            let x = x_min + x_range * (col as f64 + 0.5) / sx as f64;
+            let y = y_min + y_range * (row as f64 + 0.5) / sy as f64;
+            values[row * sx + col] = iterate_fn(x, y, max_iter);
+        }
+    }
+
+    let total = values.len() as f64;
+    let inside_count = values.iter().filter(|&&v| v == 0.0).count() as f64;
+    let inside_frac = inside_count / total;
+
+    // ── Check 1: inside fraction (5-35% is ideal) ───────────────────────
+    let inside_score = if inside_frac < 0.01 || inside_frac > 0.60 {
+        0.05  // Almost all black or all exterior — very boring
+    } else if inside_frac >= 0.05 && inside_frac <= 0.35 {
+        1.0
+    } else {
+        0.4
+    };
+
+    // ── Check 2: detail spread across the width ─────────────────────────
+    // Split the viewport into 4 horizontal quarters.
+    // Each quarter must have a mix of inside/outside to score well.
+    let quarter_w = sx / 4;
+    let mut quarters_active = 0u32;
+    for q in 0..4 {
+        let mut q_inside = 0;
+        let mut q_total = 0;
+        for row in 0..sy {
+            for col in (q * quarter_w)..((q + 1) * quarter_w) {
+                q_total += 1;
+                if values[row * sx + col] == 0.0 {
+                    q_inside += 1;
+                }
+            }
+        }
+        let q_frac = q_inside as f64 / q_total as f64;
+        // Quarter is "active" if it has a meaningful mix (not >90% one thing)
+        if q_frac > 0.05 && q_frac < 0.90 {
+            quarters_active += 1;
+        }
+    }
+    // Want at least 3 of 4 quarters to have detail
+    let spread_score = match quarters_active {
+        4 => 1.0,
+        3 => 0.7,
+        2 => 0.3,
+        _ => 0.05,
+    };
+
+    // ── Check 3: iteration diversity (color richness) ───────────────────
+    let escaped: Vec<f64> = values.iter().copied().filter(|&v| v > 0.0).collect();
+    let diversity_score = if escaped.is_empty() {
+        0.0
+    } else {
+        let mean = escaped.iter().sum::<f64>() / escaped.len() as f64;
+        let variance = escaped.iter()
+            .map(|&v| (v - mean) * (v - mean))
+            .sum::<f64>() / escaped.len() as f64;
+        let std_dev = variance.sqrt();
+        // Normalize: std_dev of ~10% of max_iter is excellent
+        (std_dev / max_iter as f64 * 10.0).min(1.0)
+    };
+
+    // ── Check 4: mean iteration depth ───────────────────────────────────
+    let depth_score = if escaped.is_empty() {
+        0.0
+    } else {
+        let mean = escaped.iter().sum::<f64>() / escaped.len() as f64;
+        (mean / max_iter as f64 * 5.0).min(1.0)
+    };
+
+    inside_score * 0.25 + spread_score * 0.35 + diversity_score * 0.25 + depth_score * 0.15
+}
+
+// ── Parameter Generation with Quality Search ────────────────────────────────
 
 struct FractalParams {
     center: (f64, f64),
@@ -204,99 +401,175 @@ struct FractalParams {
     color_offset: f64,
 }
 
-fn random_mandelbrot_params(rng: &mut Rng) -> FractalParams {
-    let locations: [(f64, f64, f64); 12] = [
-        (-0.75, 0.0, 1.0),
-        (-0.7435669, 0.1314023, 200.0),
-        (-0.7453, 0.1127, 500.0),
-        (-0.16, 1.0405, 50.0),
-        (-1.25066, 0.02012, 100.0),
-        (-0.235125, 0.827215, 200.0),
-        (0.001643721971153, 0.822467633298876, 1000.0),
-        (-1.749, 0.0, 1000.0),
-        (-0.74803, 0.06810, 300.0),
-        (-0.77568377, 0.13646737, 5000.0),
-        (-1.985424253345, -0.0000000032175, 50000.0),
-        (-0.1011, 0.9563, 30.0),
-    ];
+fn find_interesting_mandelbrot(rng: &mut Rng, max_iter: u32) -> FractalParams {
+    let mut best_params = FractalParams {
+        center: (-0.75, 0.0),
+        zoom: 1.0,
+        julia_c: None,
+        color_offset: rng.f64(),
+    };
+    let mut best_score = 0.0f64;
 
-    let (cx, cy, base_zoom) = rng.choose(&locations);
-    let jitter = 0.1 / base_zoom;
-    let center = (
-        cx + rng.range(-jitter, jitter),
-        cy + rng.range(-jitter, jitter),
-    );
-    let zoom = base_zoom * rng.range(0.5, 2.0);
+    for _ in 0..80 {
+        // Strategy: pick a random angle, shoot a ray from origin,
+        // find where it crosses the set boundary, then zoom in there.
+        let angle = rng.range(0.0, std::f64::consts::TAU);
+        let ray_len = 2.5;
+        let outside = (ray_len * angle.cos(), ray_len * angle.sin());
+        let inside_pt = (-0.1, 0.0);
 
-    FractalParams { center, zoom, julia_c: None, color_offset: rng.f64() }
+        let boundary = find_boundary_point(outside, inside_pt, max_iter);
+
+        // Try various zoom levels at this boundary point
+        let zoom = 10.0f64.powf(rng.range(1.5, 4.0)); // ~30x to ~10000x
+
+        let score = score_viewport(
+            boundary, zoom, max_iter,
+            &|x, y, mi| iterate_mandelbrot(x, y, mi),
+        );
+
+        if score > best_score {
+            best_score = score;
+            best_params = FractalParams {
+                center: boundary,
+                zoom,
+                julia_c: None,
+                color_offset: rng.f64(),
+            };
+        }
+
+        if best_score > 0.80 {
+            break;
+        }
+    }
+
+    best_params
 }
 
-fn random_julia_params(rng: &mut Rng) -> FractalParams {
-    let constants: [(f64, f64); 14] = [
-        (-0.7269, 0.1889),
-        (-0.8, 0.156),
-        (-0.4, 0.6),
-        (0.285, 0.01),
-        (0.285, 0.013),
-        (-0.70176, -0.3842),
-        (-0.835, -0.2321),
-        (-0.1, 0.651),
-        (0.355, 0.355),
-        (-0.54, 0.54),
-        (0.37, 0.1),
-        (-0.12, -0.77),
-        (0.28, 0.008),
-        (-0.62, -0.44),
+fn find_interesting_julia(rng: &mut Rng, max_iter: u32) -> FractalParams {
+    let mut best_params = FractalParams {
+        center: (0.0, 0.0),
+        zoom: 1.0,
+        julia_c: Some((-0.7269, 0.1889)),
+        color_offset: rng.f64(),
+    };
+    let mut best_score = 0.0f64;
+
+    for _ in 0..50 {
+        // Pick c from the Mandelbrot boundary — these produce connected,
+        // detailed Julia sets
+        let angle = rng.range(0.0, std::f64::consts::TAU);
+        let outside = (2.0 * angle.cos(), 2.0 * angle.sin());
+        let inside = (-0.1, 0.0);
+        let c = find_boundary_point(outside, inside, 200);
+
+        // Small perturbation toward outside for more detail
+        let perturb = rng.range(0.001, 0.02);
+        let c = (
+            c.0 + perturb * (c.0 - inside.0),
+            c.1 + perturb * (c.1 - inside.1),
+        );
+
+        let zoom = 10.0f64.powf(rng.range(0.0, 1.5));
+
+        let score = score_viewport(
+            (0.0, 0.0), zoom, max_iter,
+            &|x, y, mi| iterate_julia(x, y, c.0, c.1, mi),
+        );
+
+        if score > best_score {
+            best_score = score;
+            best_params = FractalParams {
+                center: (0.0, 0.0),
+                zoom,
+                julia_c: Some(c),
+                color_offset: rng.f64(),
+            };
+        }
+
+        if best_score > 0.80 {
+            break;
+        }
+    }
+
+    best_params
+}
+
+fn find_interesting_burning_ship(rng: &mut Rng, max_iter: u32) -> FractalParams {
+    let mut best_params = FractalParams {
+        center: (-1.75, -0.04),
+        zoom: 30.0,
+        julia_c: None,
+        color_offset: rng.f64(),
+    };
+    let mut best_score = 0.0f64;
+
+    // The Burning Ship's interesting features are its "masts" and "hull".
+    // Curated regions known to have dramatic architectural structures,
+    // plus boundary search from known inside points.
+    let curated: [(f64, f64, f64, f64); 10] = [
+        // (center_x, center_y, min_zoom, max_zoom)
+        (-1.755, -0.028, 20.0, 200.0),    // Main mast
+        (-1.762, -0.028, 50.0, 300.0),     // Upper mast detail
+        (-1.78, -0.008, 10.0, 80.0),       // Hull bow
+        (-1.74, -0.03, 15.0, 100.0),       // Rigging
+        (-1.77, -0.01, 20.0, 150.0),       // Mast base
+        (-1.76, -0.035, 30.0, 200.0),      // Between masts
+        (-1.7, -0.05, 3.0, 20.0),          // Wide ship view
+        (-1.755, -0.02, 40.0, 250.0),      // Mast tip
+        (-1.765, -0.015, 30.0, 180.0),     // Hull detail
+        (-0.515, -0.565, 20.0, 150.0),     // Satellite ship
     ];
 
-    let (cr, ci) = rng.choose(&constants);
-    let julia_c = (
-        cr + rng.range(-0.02, 0.02),
-        ci + rng.range(-0.02, 0.02),
-    );
-    let zoom = rng.range(0.8, 3.0);
+    for _ in 0..80 {
+        let (cx, cy, min_z, max_z) = rng.choose(&curated);
+
+        // Jitter the center slightly (scaled to zoom)
+        let zoom = 10.0f64.powf(rng.range(min_z.log10(), max_z.log10()));
+        let jitter = 0.5 / zoom;
+        let center = (
+            cx + rng.range(-jitter, jitter),
+            cy + rng.range(-jitter, jitter),
+        );
+
+        let score = score_viewport(
+            center, zoom, max_iter,
+            &|x, y, mi| iterate_burning_ship(x, y, mi),
+        );
+
+        if score > best_score {
+            best_score = score;
+            best_params = FractalParams {
+                center,
+                zoom,
+                julia_c: None,
+                color_offset: rng.f64(),
+            };
+        }
+
+        if best_score > 0.80 {
+            break;
+        }
+    }
+
+    best_params
+}
+
+fn find_interesting_newton(rng: &mut Rng, _max_iter: u32) -> FractalParams {
+    // Newton fractals are interesting everywhere near root boundaries.
+    // Zoom into the area around the origin where all three basins meet.
+    let center = (rng.range(-0.3, 0.3), rng.range(-0.3, 0.3));
+    let zoom = 10.0f64.powf(rng.range(0.3, 2.0));
 
     FractalParams {
-        center: (0.0, 0.0),
+        center,
         zoom,
-        julia_c: Some(julia_c),
+        julia_c: None,
         color_offset: rng.f64(),
     }
 }
 
-fn random_burning_ship_params(rng: &mut Rng) -> FractalParams {
-    let locations: [(f64, f64, f64, f64); 10] = [
-        (-1.755, -0.028, 20.0, 200.0),
-        (-1.762, -0.028, 50.0, 300.0),
-        (-1.78, -0.008, 10.0, 80.0),
-        (-1.74, -0.03, 15.0, 100.0),
-        (-1.77, -0.01, 20.0, 150.0),
-        (-1.76, -0.035, 30.0, 200.0),
-        (-1.7, -0.05, 3.0, 20.0),
-        (-1.755, -0.02, 40.0, 250.0),
-        (-1.765, -0.015, 30.0, 180.0),
-        (-0.515, -0.565, 20.0, 150.0),
-    ];
-
-    let (cx, cy, min_z, max_z) = rng.choose(&locations);
-    let zoom = 10.0f64.powf(rng.range(min_z.log10(), max_z.log10()));
-    let jitter = 0.5 / zoom;
-    let center = (
-        cx + rng.range(-jitter, jitter),
-        cy + rng.range(-jitter, jitter),
-    );
-
-    FractalParams { center, zoom, julia_c: None, color_offset: rng.f64() }
-}
-
-fn random_newton_params(rng: &mut Rng) -> FractalParams {
-    let center = (rng.range(-0.3, 0.3), rng.range(-0.3, 0.3));
-    let zoom = 10.0f64.powf(rng.range(0.3, 2.0));
-
-    FractalParams { center, zoom, julia_c: None, color_offset: rng.f64() }
-}
-
-// ── Fractal Computation ─────────────────────────────────────────────────────
+// ── Fractal Computation (full image) ────────────────────────────────────────
 
 fn compute_mandelbrot(
     width: u32, height: u32,
@@ -320,25 +593,7 @@ fn compute_mandelbrot(
             let ci = y_min + py as f64 * y_step;
             for px in 0..w {
                 let cr = x_min + px as f64 * x_step;
-                let mut zr = 0.0;
-                let mut zi = 0.0;
-                let mut i = 0u32;
-                while i < max_iter {
-                    let zr2 = zr * zr;
-                    let zi2 = zi * zi;
-                    if zr2 + zi2 > 65536.0 {
-                        break;
-                    }
-                    zi = 2.0 * zr * zi + ci;
-                    zr = zr2 - zi2 + cr;
-                    i += 1;
-                }
-                row[px] = if i < max_iter {
-                    let mag = (zr * zr + zi * zi).sqrt();
-                    i as f64 + 1.0 - mag.ln().ln() / std::f64::consts::LN_2
-                } else {
-                    0.0
-                };
+                row[px] = iterate_mandelbrot(cr, ci, max_iter);
             }
         });
     result
@@ -364,26 +619,9 @@ fn compute_julia(
         .enumerate()
         .for_each(|(py, row)| {
             for px in 0..w {
-                let mut zr = x_min + px as f64 * x_step;
-                let mut zi = y_min + py as f64 * y_step;
-                let mut i = 0u32;
-                while i < max_iter {
-                    let zr2 = zr * zr;
-                    let zi2 = zi * zi;
-                    if zr2 + zi2 > 65536.0 {
-                        break;
-                    }
-                    let new_zr = zr2 - zi2 + c.0;
-                    zi = 2.0 * zr * zi + c.1;
-                    zr = new_zr;
-                    i += 1;
-                }
-                row[px] = if i < max_iter {
-                    let mag = (zr * zr + zi * zi).sqrt();
-                    i as f64 + 1.0 - mag.ln().ln() / std::f64::consts::LN_2
-                } else {
-                    0.0
-                };
+                let zr = x_min + px as f64 * x_step;
+                let zi = y_min + py as f64 * y_step;
+                row[px] = iterate_julia(zr, zi, c.0, c.1, max_iter);
             }
         });
     result
@@ -411,27 +649,7 @@ fn compute_burning_ship(
             let ci = y_min + py as f64 * y_step;
             for px in 0..w {
                 let cr = x_min + px as f64 * x_step;
-                let mut zr: f64 = 0.0;
-                let mut zi: f64 = 0.0;
-                let mut i = 0u32;
-                while i < max_iter {
-                    let azr = zr.abs();
-                    let azi = zi.abs();
-                    let zr2 = azr * azr;
-                    let zi2 = azi * azi;
-                    if zr2 + zi2 > 65536.0 {
-                        break;
-                    }
-                    zi = 2.0 * azr * azi + ci;
-                    zr = zr2 - zi2 + cr;
-                    i += 1;
-                }
-                row[px] = if i < max_iter {
-                    let mag = (zr * zr + zi * zi).sqrt();
-                    i as f64 + 1.0 - mag.ln().ln() / std::f64::consts::LN_2
-                } else {
-                    0.0
-                };
+                row[px] = iterate_burning_ship(cr, ci, max_iter);
             }
         });
     result
@@ -560,13 +778,15 @@ fn generate(
     output: Option<PathBuf>,
     rng: &mut Rng,
 ) {
+    let t_search = Instant::now();
     let params = match fractal {
-        FractalType::Mandelbrot => random_mandelbrot_params(rng),
-        FractalType::Julia => random_julia_params(rng),
-        FractalType::BurningShip => random_burning_ship_params(rng),
-        FractalType::Newton => random_newton_params(rng),
+        FractalType::Mandelbrot => find_interesting_mandelbrot(rng, max_iter),
+        FractalType::Julia => find_interesting_julia(rng, max_iter),
+        FractalType::BurningShip => find_interesting_burning_ship(rng, max_iter),
+        FractalType::Newton => find_interesting_newton(rng, max_iter),
         FractalType::All => unreachable!(),
     };
+    let search_time = t_search.elapsed();
 
     let out_path = output.unwrap_or_else(|| {
         PathBuf::from(format!("fractal_{fractal}_{palette}_{WIDTH}x{HEIGHT}.png"))
@@ -576,11 +796,11 @@ fn generate(
         "Generating {fractal} ({WIDTH}x{HEIGHT}, palette={palette}, max_iter={max_iter})"
     );
     println!(
-        "  center=({:.6}, {:.6}), zoom={:.1}",
-        params.center.0, params.center.1, params.zoom
+        "  Found interesting view in {:.2}s: center=({:.10}, {:.10}), zoom={:.1}",
+        search_time.as_secs_f64(), params.center.0, params.center.1, params.zoom
     );
     if let Some(c) = params.julia_c {
-        println!("  julia c=({:.6}, {:.6})", c.0, c.1);
+        println!("  julia c=({:.10}, {:.10})", c.0, c.1);
     }
 
     let t0 = Instant::now();
