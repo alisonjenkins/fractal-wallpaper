@@ -780,65 +780,79 @@ fn find_interesting_newton(rng: &mut Rng, _max_iter: u32) -> FractalParams {
 // ── Fractal Computation (full image) ────────────────────────────────────────
 
 /// SIMD smooth iteration for 4 Mandelbrot pixels at once.
-/// Returns array of smooth iteration counts (0.0 = inside set).
+/// Uses SIMD masks throughout the hot loop — no scalar extraction until the end.
 fn iterate_mandelbrot_4x(cr: f64x4, ci: f64x4, max_iter: u32) -> [f64; 4] {
     // Pre-check cardioid/bulb for each lane
     let cr_arr: [f64; 4] = bytemuck::cast(cr);
     let ci_arr: [f64; 4] = bytemuck::cast(ci);
-    let mut result = [0.0f64; 4];
-    let mut all_skip = true;
-    let mut done = [false; 4];
+    let mut skip_mask = f64x4::ZERO; // All-ones for lanes to skip
+    let mut any_active = false;
     for k in 0..4 {
         if in_cardioid_or_bulb(cr_arr[k], ci_arr[k]) {
-            done[k] = true;
+            // Set this lane to all-ones (true mask)
+            let mut arr = [0.0f64; 4];
+            arr[k] = f64::from_bits(u64::MAX);
+            skip_mask = skip_mask | f64x4::from(arr);
         } else {
-            all_skip = false;
+            any_active = true;
         }
     }
-    if all_skip { return result; }
+    if !any_active { return [0.0; 4]; }
 
     let mut zr = f64x4::ZERO;
     let mut zi = f64x4::ZERO;
-    let mut counts = [0u32; 4];
+    // Track counts as f64x4 for pure SIMD increment
+    let mut counts = f64x4::ZERO;
+    let one = f64x4::splat(1.0);
     let threshold = f64x4::splat(65536.0);
     let two = f64x4::splat(2.0);
+    // done_mask: all-ones for lanes that are finished (escaped or cardioid-skipped)
+    let mut done_mask = skip_mask;
 
     for _ in 0..max_iter {
         let zr2 = zr * zr;
         let zi2 = zi * zi;
         let mag2 = zr2 + zi2;
 
-        // Check escape for each lane
-        let escaped = mag2.cmp_gt(threshold);
-        let escaped_arr: [u64; 4] = bytemuck::cast(escaped);
-        for k in 0..4 {
-            if !done[k] {
-                if escaped_arr[k] != 0 {
-                    done[k] = true;
-                } else {
-                    counts[k] += 1;
-                }
-            }
-        }
+        // Lanes that just escaped this iteration
+        let just_escaped = mag2.cmp_gt(threshold);
+        done_mask = done_mask | just_escaped;
 
-        if done[0] && done[1] && done[2] && done[3] {
+        // Increment counts only for still-active lanes (not done)
+        // active = NOT done_mask before this escape check
+        // We want to count this iteration for lanes that haven't escaped yet
+        // The increment must happen before we update done_mask, so use the
+        // mask from before just_escaped was folded in.
+        // Actually we already folded it in, so we need to use: NOT (done_mask)
+        // But the lane that JUST escaped should still get its count incremented.
+        // Solution: increment for lanes NOT in the old done_mask.
+        // Recompute: active lanes are those not yet done BEFORE this iteration's escape.
+        let active = !done_mask | just_escaped; // Was active: not done, OR just now escaped
+        let not_skip = !skip_mask; // Never count cardioid-skipped lanes
+        counts = counts + (active & not_skip).blend(one, f64x4::ZERO);
+
+        // All lanes done?
+        let done_bits: [u64; 4] = bytemuck::cast(done_mask);
+        if done_bits[0] != 0 && done_bits[1] != 0 && done_bits[2] != 0 && done_bits[3] != 0 {
             break;
         }
 
-        // z = z^2 + c (compute for all lanes — wasted work on escaped lanes is
-        // cheaper than branch mispredictions)
+        // z = z^2 + c for all lanes
         let new_zi = two * zr * zi + ci;
         let new_zr = zr2 - zi2 + cr;
         zr = new_zr;
         zi = new_zi;
     }
 
-    // Compute smooth coloring (only for lanes that escaped, not cardioid-skipped)
+    // Extract final values for smooth coloring (scalar — only done once)
     let mag2_arr: [f64; 4] = bytemuck::cast(zr * zr + zi * zi);
+    let counts_arr: [f64; 4] = bytemuck::cast(counts);
+    let escaped_arr: [u64; 4] = bytemuck::cast(done_mask & !skip_mask);
+    let mut result = [0.0f64; 4];
     for k in 0..4 {
-        if done[k] && counts[k] > 0 {
+        if escaped_arr[k] != 0 && counts_arr[k] > 0.0 {
             let mag = mag2_arr[k].sqrt();
-            result[k] = counts[k] as f64 + 1.0 - mag.ln().ln() / std::f64::consts::LN_2;
+            result[k] = counts_arr[k] + 1.0 - mag.ln().ln() / std::f64::consts::LN_2;
         }
     }
     result
@@ -885,30 +899,33 @@ fn compute_mandelbrot(
 }
 
 /// SIMD smooth iteration for 4 Julia pixels at once.
+/// Uses SIMD masks throughout — no scalar extraction in the hot loop.
 fn iterate_julia_4x(zr0: f64x4, zi0: f64x4, cr: f64x4, ci: f64x4, max_iter: u32) -> [f64; 4] {
     let mut zr = zr0;
     let mut zi = zi0;
-    let mut counts = [0u32; 4];
-    let mut done = [false; 4];
+    let mut counts = f64x4::ZERO;
+    let one = f64x4::splat(1.0);
     let threshold = f64x4::splat(65536.0);
     let two = f64x4::splat(2.0);
+    let mut done_mask = f64x4::ZERO;
 
     for _ in 0..max_iter {
         let zr2 = zr * zr;
         let zi2 = zi * zi;
         let mag2 = zr2 + zi2;
-        let escaped = mag2.cmp_gt(threshold);
-        let escaped_arr: [u64; 4] = bytemuck::cast(escaped);
-        for k in 0..4 {
-            if !done[k] {
-                if escaped_arr[k] != 0 {
-                    done[k] = true;
-                } else {
-                    counts[k] += 1;
-                }
-            }
+        let just_escaped = mag2.cmp_gt(threshold);
+
+        // Increment counts for lanes not yet done (including those escaping now)
+        let active = !done_mask;
+        counts = counts + active.blend(one, f64x4::ZERO);
+
+        done_mask = done_mask | just_escaped;
+
+        let done_bits: [u64; 4] = bytemuck::cast(done_mask);
+        if done_bits[0] != 0 && done_bits[1] != 0 && done_bits[2] != 0 && done_bits[3] != 0 {
+            break;
         }
-        if done[0] && done[1] && done[2] && done[3] { break; }
+
         let new_zr = zr2 - zi2 + cr;
         let new_zi = two * zr * zi + ci;
         zr = new_zr;
@@ -916,11 +933,13 @@ fn iterate_julia_4x(zr0: f64x4, zi0: f64x4, cr: f64x4, ci: f64x4, max_iter: u32)
     }
 
     let mag2_arr: [f64; 4] = bytemuck::cast(zr * zr + zi * zi);
+    let counts_arr: [f64; 4] = bytemuck::cast(counts);
+    let escaped_arr: [u64; 4] = bytemuck::cast(done_mask);
     let mut result = [0.0f64; 4];
     for k in 0..4 {
-        if done[k] {
+        if escaped_arr[k] != 0 && counts_arr[k] > 0.0 {
             let mag = mag2_arr[k].sqrt();
-            result[k] = counts[k] as f64 + 1.0 - mag.ln().ln() / std::f64::consts::LN_2;
+            result[k] = counts_arr[k] + 1.0 - mag.ln().ln() / std::f64::consts::LN_2;
         }
     }
     result
@@ -968,13 +987,15 @@ fn compute_julia(
 }
 
 /// SIMD smooth iteration for 4 Burning Ship pixels at once.
+/// Uses SIMD masks throughout — no scalar extraction in the hot loop.
 fn iterate_burning_ship_4x(cr: f64x4, ci: f64x4, max_iter: u32) -> [f64; 4] {
     let mut zr = f64x4::ZERO;
     let mut zi = f64x4::ZERO;
-    let mut counts = [0u32; 4];
-    let mut done = [false; 4];
+    let mut counts = f64x4::ZERO;
+    let one = f64x4::splat(1.0);
     let threshold = f64x4::splat(65536.0);
     let two = f64x4::splat(2.0);
+    let mut done_mask = f64x4::ZERO;
 
     for _ in 0..max_iter {
         let azr = zr.abs();
@@ -982,32 +1003,32 @@ fn iterate_burning_ship_4x(cr: f64x4, ci: f64x4, max_iter: u32) -> [f64; 4] {
         let zr2 = azr * azr;
         let zi2 = azi * azi;
         let mag2 = zr2 + zi2;
-        let escaped = mag2.cmp_gt(threshold);
-        let escaped_arr: [u64; 4] = bytemuck::cast(escaped);
-        for k in 0..4 {
-            if !done[k] {
-                if escaped_arr[k] != 0 {
-                    done[k] = true;
-                } else {
-                    counts[k] += 1;
-                }
-            }
+        let just_escaped = mag2.cmp_gt(threshold);
+
+        let active = !done_mask;
+        counts = counts + active.blend(one, f64x4::ZERO);
+
+        done_mask = done_mask | just_escaped;
+
+        let done_bits: [u64; 4] = bytemuck::cast(done_mask);
+        if done_bits[0] != 0 && done_bits[1] != 0 && done_bits[2] != 0 && done_bits[3] != 0 {
+            break;
         }
-        if done[0] && done[1] && done[2] && done[3] { break; }
+
         let new_zi = two * azr * azi + ci;
         let new_zr = zr2 - zi2 + cr;
         zr = new_zr;
         zi = new_zi;
     }
 
-    let zr_final = zr;
-    let zi_final = zi;
-    let mag2_arr: [f64; 4] = bytemuck::cast(zr_final * zr_final + zi_final * zi_final);
+    let mag2_arr: [f64; 4] = bytemuck::cast(zr * zr + zi * zi);
+    let counts_arr: [f64; 4] = bytemuck::cast(counts);
+    let escaped_arr: [u64; 4] = bytemuck::cast(done_mask);
     let mut result = [0.0f64; 4];
     for k in 0..4 {
-        if done[k] {
+        if escaped_arr[k] != 0 && counts_arr[k] > 0.0 {
             let mag = mag2_arr[k].sqrt();
-            result[k] = counts[k] as f64 + 1.0 - mag.ln().ln() / std::f64::consts::LN_2;
+            result[k] = counts_arr[k] + 1.0 - mag.ln().ln() / std::f64::consts::LN_2;
         }
     }
     result
