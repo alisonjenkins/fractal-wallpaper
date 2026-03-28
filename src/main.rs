@@ -104,6 +104,10 @@ struct Cli {
     /// Load parameters from JSON file (overrides fractal type and randomization)
     #[arg(long)]
     load_params: Option<PathBuf>,
+
+    /// Load custom palette from JSON file (array of 12 [R,G,B] arrays, values 0-255)
+    #[arg(long)]
+    palette_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq, Serialize, Deserialize)]
@@ -129,12 +133,18 @@ enum Palette {
     Frost,
     Earth,
     Sakura,
+    CatppuccinMocha,
+    CatppuccinMacchiato,
+    CatppuccinFrappe,
+    CatppuccinLatte,
     Random,
 }
 
-const ALL_PALETTES: [Palette; 8] = [
+const ALL_PALETTES: [Palette; 12] = [
     Palette::Twilight, Palette::Ocean, Palette::Fire,
     Palette::Neon, Palette::Frost, Palette::Earth, Palette::Sakura,
+    Palette::CatppuccinMocha, Palette::CatppuccinMacchiato,
+    Palette::CatppuccinFrappe, Palette::CatppuccinLatte,
     Palette::Random,
 ];
 
@@ -165,6 +175,10 @@ impl std::fmt::Display for Palette {
             Self::Frost => write!(f, "frost"),
             Self::Earth => write!(f, "earth"),
             Self::Sakura => write!(f, "sakura"),
+            Self::CatppuccinMocha => write!(f, "catppuccin-mocha"),
+            Self::CatppuccinMacchiato => write!(f, "catppuccin-macchiato"),
+            Self::CatppuccinFrappe => write!(f, "catppuccin-frappe"),
+            Self::CatppuccinLatte => write!(f, "catppuccin-latte"),
             Self::Random => write!(f, "random"),
         }
     }
@@ -307,6 +321,65 @@ fn palette_anchors(palette: Palette) -> Vec<[u8; 3]> {
             [30, 5, 20], [80, 10, 50], [150, 30, 80], [200, 60, 120],
             [240, 110, 160], [255, 170, 200], [255, 220, 230], [255, 245, 245],
             [255, 200, 210], [230, 130, 170], [180, 60, 110], [100, 20, 60],
+        ],
+        // Catppuccin palettes — accent colors cycling through with base tones
+        // Colors from https://catppuccin.com/palette
+        Palette::CatppuccinMocha => vec![
+            // Crust, Mantle, Base, Surface0 → accents → back to dark
+            [17, 17, 27],    // Crust
+            [24, 24, 37],    // Mantle
+            [137, 180, 250], // Blue
+            [116, 199, 236], // Sapphire
+            [148, 226, 213], // Teal
+            [166, 227, 161], // Green
+            [249, 226, 175], // Yellow
+            [250, 179, 135], // Peach
+            [243, 139, 168], // Red
+            [245, 194, 231], // Pink
+            [203, 166, 247], // Mauve
+            [30, 30, 46],    // Base
+        ],
+        Palette::CatppuccinMacchiato => vec![
+            [24, 25, 38],    // Crust
+            [30, 32, 48],    // Mantle
+            [138, 173, 244], // Blue
+            [125, 196, 228], // Sapphire
+            [139, 213, 202], // Teal
+            [166, 218, 149], // Green
+            [238, 212, 159], // Yellow
+            [245, 169, 127], // Peach
+            [237, 135, 150], // Red
+            [245, 189, 230], // Pink
+            [198, 160, 246], // Mauve
+            [36, 39, 58],    // Base
+        ],
+        Palette::CatppuccinFrappe => vec![
+            [35, 38, 52],    // Crust
+            [41, 44, 60],    // Mantle
+            [140, 170, 238], // Blue
+            [133, 193, 220], // Sapphire
+            [129, 200, 190], // Teal
+            [166, 209, 137], // Green
+            [229, 200, 144], // Yellow
+            [239, 159, 118], // Peach
+            [231, 130, 132], // Red
+            [244, 184, 228], // Pink
+            [202, 158, 230], // Mauve
+            [48, 52, 70],    // Base
+        ],
+        Palette::CatppuccinLatte => vec![
+            [220, 224, 232], // Crust
+            [230, 233, 239], // Mantle
+            [30, 102, 245],  // Blue
+            [32, 159, 181],  // Sapphire
+            [23, 146, 153],  // Teal
+            [64, 160, 43],   // Green
+            [223, 142, 29],  // Yellow
+            [254, 100, 11],  // Peach
+            [210, 15, 57],   // Red
+            [234, 118, 203], // Pink
+            [136, 57, 239],  // Mauve
+            [239, 241, 245], // Base
         ],
         Palette::Random => {
             // Fallback if Random reaches here unresolved — use a pleasant default
@@ -2290,6 +2363,7 @@ fn generate(
     width: u32,
     height: u32,
     supersample: u32,
+    custom_palette: Option<&Vec<[u8; 3]>>,
     output: Option<PathBuf>,
     save_params: Option<&PathBuf>,
     rng: &mut Rng,
@@ -2317,12 +2391,13 @@ fn generate(
         params.samples = s;
     }
 
-    // Resolve Random palette to concrete anchors
-    if palette == Palette::Random && params.random_palette.is_none() {
+    // Resolve palette anchors: custom file > random generation > preset
+    if let Some(custom) = custom_palette {
+        params.random_palette = Some(custom.clone());
+    } else if palette == Palette::Random && params.random_palette.is_none() {
         params.random_palette = Some(generate_random_palette(rng));
     }
 
-    // Get the resolved anchors for rendering
     let anchors = if let Some(ref custom) = params.random_palette {
         custom.clone()
     } else {
@@ -2527,6 +2602,20 @@ fn main() {
     println!("Seed: {seed}");
     let mut rng = Rng::new(seed);
 
+    // Load custom palette from file if specified
+    let custom_palette: Option<Vec<[u8; 3]>> = cli.palette_file.as_ref().map(|path| {
+        let json = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| { eprintln!("Error reading palette file {}: {e}", path.display()); std::process::exit(1); });
+        let anchors: Vec<[u8; 3]> = serde_json::from_str(&json)
+            .unwrap_or_else(|e| { eprintln!("Error parsing palette file: {e}\nExpected JSON array of 12 [R,G,B] arrays, e.g. [[255,0,0],[0,255,0],...]"); std::process::exit(1); });
+        if anchors.len() < 2 {
+            eprintln!("Palette file must contain at least 2 color anchors");
+            std::process::exit(1);
+        }
+        println!("Loaded custom palette from {} ({} anchors)", path.display(), anchors.len());
+        anchors
+    });
+
     match cli.fractal {
         FractalType::All => {
             let types = [
@@ -2542,12 +2631,12 @@ fn main() {
             ];
             for ft in types {
                 let pal = cli.palette.unwrap_or_else(|| rng.choose(&ALL_PALETTES));
-                generate(ft, pal, cli.max_iter, cli.samples, cli.width, cli.height, cli.supersample, None, cli.save_params.as_ref(), &mut rng);
+                generate(ft, pal, cli.max_iter, cli.samples, cli.width, cli.height, cli.supersample, custom_palette.as_ref(), None, cli.save_params.as_ref(), &mut rng);
             }
         }
         ft => {
             let pal = cli.palette.unwrap_or_else(|| rng.choose(&ALL_PALETTES));
-            generate(ft, pal, cli.max_iter, cli.samples, cli.width, cli.height, cli.supersample, cli.output, cli.save_params.as_ref(), &mut rng);
+            generate(ft, pal, cli.max_iter, cli.samples, cli.width, cli.height, cli.supersample, custom_palette.as_ref(), cli.output, cli.save_params.as_ref(), &mut rng);
         }
     }
 }
