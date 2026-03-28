@@ -1667,9 +1667,11 @@ fn compute_buddhabrot(
 fn render_buddhabrot(
     r_data: &[f64], g_data: &[f64], b_data: &[f64],
     width: u32, height: u32,
+    palette: Palette, color_offset: f64,
 ) -> RgbImage {
-    // Use percentile-based normalization to avoid outlier domination,
-    // then gamma correction for brightness
+    let cmap = build_colormap(palette, 2048);
+    let cmap_len = cmap.len();
+    let offset = (color_offset * cmap_len as f64) as usize;
     let gamma = 0.4;
 
     // Find 99.5th percentile for each channel to normalize against
@@ -1691,10 +1693,30 @@ fn render_buddhabrot(
         if *r == 0.0 && *g == 0.0 && *b == 0.0 {
             img.put_pixel(x, y, Rgb([0, 0, 0]));
         } else {
+            let rn = (*r / r_norm).min(1.0);
+            let gn = (*g / g_norm).min(1.0);
+            let bn = (*b / b_norm).min(1.0);
+
+            // Brightness from total density across all channels
+            let brightness = ((rn + gn + bn) / 3.0).powf(gamma);
+
+            // Color position from channel ratios — different iteration depths
+            // produce different structural features, driving palette variation
+            let total = rn + gn + bn;
+            let color_pos = if total > 0.0 {
+                // Weight channels to spread across palette:
+                // deep iterations (r) -> low palette, shallow (b) -> high palette
+                (rn * 0.0 + gn * 0.5 + bn * 1.0) / total
+            } else {
+                0.0
+            };
+
+            let color_idx = ((color_pos * cmap_len as f64) as usize + offset) % cmap_len;
+            let base = cmap[color_idx];
             img.put_pixel(x, y, Rgb([
-                ((*r / r_norm).min(1.0).powf(gamma) * 255.0) as u8,
-                ((*g / g_norm).min(1.0).powf(gamma) * 255.0) as u8,
-                ((*b / b_norm).min(1.0).powf(gamma) * 255.0) as u8,
+                (base[0] as f64 * brightness).min(255.0) as u8,
+                (base[1] as f64 * brightness).min(255.0) as u8,
+                (base[2] as f64 * brightness).min(255.0) as u8,
             ]));
         }
     }
@@ -2256,7 +2278,7 @@ fn generate(
         FractalType::Buddhabrot => {
             let (ri, gi, bi) = params.buddhabrot_iters.unwrap();
             let (r, g, b) = compute_buddhabrot(render_w, render_h, params.samples, ri, gi, bi, seed);
-            render_buddhabrot(&r, &g, &b, render_w, render_h)
+            render_buddhabrot(&r, &g, &b, render_w, render_h, palette, params.color_offset)
         }
         FractalType::Flame => {
             let transforms = params.flame_transforms.as_ref().unwrap();
@@ -2342,7 +2364,7 @@ fn main() {
             FractalType::Buddhabrot => {
                 let (ri, gi, bi) = saved.params.buddhabrot_iters.unwrap();
                 let (r, g, b) = compute_buddhabrot(render_w, render_h, saved.params.samples, ri, gi, bi, seed);
-                render_buddhabrot(&r, &g, &b, render_w, render_h)
+                render_buddhabrot(&r, &g, &b, render_w, render_h, saved.palette, saved.params.color_offset)
             }
             FractalType::Flame => {
                 let transforms = saved.params.flame_transforms.as_ref().unwrap();
