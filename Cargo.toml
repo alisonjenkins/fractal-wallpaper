@@ -1,16 +1,27 @@
 [package]
 name = "fractal-wallpaper"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+
+[lib]
+name = "fractal_wallpaper"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fractal-wallpaper"
+path = "src/main.rs"
 
 [dependencies]
 image = "0.25"
 rayon = "1.10"
-clap = { version = "4", features = ["derive"] }
 wide = "0.7"
 bytemuck = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dependencies.clap]
+version = "4"
+features = ["derive"]
 
 [profile.release]
 lto = true
