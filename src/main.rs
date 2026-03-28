@@ -1,6 +1,7 @@
 use clap::{Parser, ValueEnum};
 use image::{Rgb, RgbImage};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -95,9 +96,17 @@ struct Cli {
     /// Supersampling factor for anti-aliasing (2 = render at 2x, then downsample)
     #[arg(long, default_value_t = 1)]
     supersample: u32,
+
+    /// Save parameters to JSON file for later reproduction
+    #[arg(long)]
+    save_params: Option<PathBuf>,
+
+    /// Load parameters from JSON file (overrides fractal type and randomization)
+    #[arg(long)]
+    load_params: Option<PathBuf>,
 }
 
-#[derive(Clone, Copy, ValueEnum, PartialEq)]
+#[derive(Clone, Copy, ValueEnum, PartialEq, Serialize, Deserialize)]
 enum FractalType {
     Mandelbrot,
     Julia,
@@ -109,7 +118,7 @@ enum FractalType {
     All,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, ValueEnum, Serialize, Deserialize)]
 enum Palette {
     Twilight,
     Ocean,
@@ -487,6 +496,7 @@ fn score_viewport(
 
 // ── Parameter Generation with Quality Search ────────────────────────────────
 
+#[derive(Serialize, Deserialize)]
 struct FractalParams {
     center: (f64, f64),
     zoom: f64,
@@ -499,13 +509,23 @@ struct FractalParams {
     samples: u64,
 }
 
-#[derive(Clone, Copy)]
+/// Saved parameter file format — includes everything needed to reproduce a fractal.
+#[derive(Serialize, Deserialize)]
+struct SavedParams {
+    fractal: FractalType,
+    palette: Palette,
+    max_iter: u32,
+    seed: u64,
+    params: FractalParams,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
 enum AttractorType {
     Clifford,
     DeJong,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 struct FlameTransform {
     a: f64, b: f64, c: f64, d: f64, e: f64, f: f64,
@@ -1874,6 +1894,7 @@ fn generate(
     height: u32,
     supersample: u32,
     output: Option<PathBuf>,
+    save_params: Option<&PathBuf>,
     rng: &mut Rng,
 ) {
     let render_w = width * supersample;
@@ -1908,6 +1929,30 @@ fn generate(
         "  Found interesting params in {:.2}s",
         search_time.as_secs_f64(),
     );
+
+    // Save params if requested
+    if let Some(path) = save_params {
+        let saved = SavedParams {
+            fractal,
+            palette,
+            max_iter,
+            seed,
+            params: FractalParams {
+                center: params.center,
+                zoom: params.zoom,
+                julia_c: params.julia_c,
+                color_offset: params.color_offset,
+                attractor_params: params.attractor_params,
+                attractor_type: params.attractor_type,
+                buddhabrot_iters: params.buddhabrot_iters,
+                flame_transforms: params.flame_transforms.clone(),
+                samples: params.samples,
+            },
+        };
+        let json = serde_json::to_string_pretty(&saved).expect("Failed to serialize params");
+        std::fs::write(path, json).expect("Failed to write params file");
+        println!("  Saved params to {}", path.display());
+    }
 
     if supersample > 1 {
         println!("  Rendering at {render_w}x{render_h} (supersample {supersample}x)");
@@ -1966,6 +2011,76 @@ fn generate(
 fn main() {
     let cli = Cli::parse();
 
+    // Load params from file if requested
+    if let Some(ref load_path) = cli.load_params {
+        let json = std::fs::read_to_string(load_path).expect("Failed to read params file");
+        let saved: SavedParams = serde_json::from_str(&json).expect("Failed to parse params file");
+        println!("Loaded params from {}", load_path.display());
+        println!("Seed: {}", saved.seed);
+
+        let mut rng = Rng::new(saved.seed);
+        let out_path = cli.output.unwrap_or_else(|| {
+            PathBuf::from(format!(
+                "fractal_{}_{}_{}x{}.png",
+                saved.fractal, saved.palette, cli.width, cli.height
+            ))
+        });
+
+        // Use loaded params directly — skip parameter search
+        let render_w = cli.width * cli.supersample;
+        let render_h = cli.height * cli.supersample;
+        let seed = rng.next_u64();
+
+        if cli.supersample > 1 {
+            println!("  Rendering at {render_w}x{render_h} (supersample {}x)", cli.supersample);
+        }
+
+        let t0 = Instant::now();
+        let img = match saved.fractal {
+            FractalType::Mandelbrot => {
+                let data = compute_mandelbrot(render_w, render_h, saved.params.center, saved.params.zoom, saved.max_iter);
+                render(&data, render_w, render_h, saved.palette, saved.params.color_offset, 12.0)
+            }
+            FractalType::Julia => {
+                let c = saved.params.julia_c.unwrap();
+                let data = compute_julia(render_w, render_h, c, saved.params.zoom, saved.max_iter);
+                render(&data, render_w, render_h, saved.palette, saved.params.color_offset, 12.0)
+            }
+            FractalType::BurningShip => {
+                let data = compute_burning_ship(render_w, render_h, saved.params.center, saved.params.zoom, saved.max_iter);
+                render(&data, render_w, render_h, saved.palette, saved.params.color_offset, 12.0)
+            }
+            FractalType::Newton => {
+                let data = compute_newton(render_w, render_h, saved.params.center, saved.params.zoom, saved.max_iter.min(500));
+                render(&data, render_w, render_h, saved.palette, saved.params.color_offset, 12.0)
+            }
+            FractalType::StrangeAttractor => {
+                let (a, b, c, d) = saved.params.attractor_params.unwrap();
+                let at = saved.params.attractor_type.unwrap();
+                let data = compute_attractor(render_w, render_h, a, b, c, d, at, saved.params.samples, seed);
+                render(&data, render_w, render_h, saved.palette, saved.params.color_offset, 2.0)
+            }
+            FractalType::Buddhabrot => {
+                let (ri, gi, bi) = saved.params.buddhabrot_iters.unwrap();
+                let (r, g, b) = compute_buddhabrot(render_w, render_h, saved.params.samples, ri, gi, bi, seed);
+                render_buddhabrot(&r, &g, &b, render_w, render_h)
+            }
+            FractalType::Flame => {
+                let transforms = saved.params.flame_transforms.as_ref().unwrap();
+                let (density, color_map) = compute_flame(render_w, render_h, transforms, saved.params.samples, seed);
+                render_flame(&density, &color_map, render_w, render_h, saved.palette, saved.params.color_offset)
+            }
+            FractalType::All => unreachable!(),
+        };
+        let img = downsample(&img, cli.supersample);
+        let t1 = Instant::now();
+        println!("  Computed in {:.2}s", (t1 - t0).as_secs_f64());
+
+        img.save(&out_path).expect("Failed to save image");
+        println!("  Saved to {}", out_path.display());
+        return;
+    }
+
     let seed = cli.seed.unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1988,12 +2103,12 @@ fn main() {
             ];
             for ft in types {
                 let pal = cli.palette.unwrap_or_else(|| rng.choose(&ALL_PALETTES));
-                generate(ft, pal, cli.max_iter, cli.samples, cli.width, cli.height, cli.supersample, None, &mut rng);
+                generate(ft, pal, cli.max_iter, cli.samples, cli.width, cli.height, cli.supersample, None, cli.save_params.as_ref(), &mut rng);
             }
         }
         ft => {
             let pal = cli.palette.unwrap_or_else(|| rng.choose(&ALL_PALETTES));
-            generate(ft, pal, cli.max_iter, cli.samples, cli.width, cli.height, cli.supersample, cli.output, &mut rng);
+            generate(ft, pal, cli.max_iter, cli.samples, cli.width, cli.height, cli.supersample, cli.output, cli.save_params.as_ref(), &mut rng);
         }
     }
 }
