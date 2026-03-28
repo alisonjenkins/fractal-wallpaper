@@ -392,10 +392,6 @@ fn palette_anchors(palette: Palette) -> Vec<[u8; 3]> {
     }
 }
 
-fn build_colormap(palette: Palette, n: usize) -> Vec<[u8; 3]> {
-    build_colormap_from_anchors(&palette_anchors(palette), n)
-}
-
 fn build_colormap_from_anchors(anchors: &[[u8; 3]], n: usize) -> Vec<[u8; 3]> {
     let num = anchors.len();
     let xs: Vec<f64> = (0..num).map(|i| i as f64 / (num - 1) as f64).collect();
@@ -2364,6 +2360,7 @@ fn generate(
     height: u32,
     supersample: u32,
     custom_palette: Option<&Vec<[u8; 3]>>,
+    palette_name: &str,
     output: Option<PathBuf>,
     save_params: Option<&PathBuf>,
     rng: &mut Rng,
@@ -2405,11 +2402,11 @@ fn generate(
     };
 
     let out_path = output.unwrap_or_else(|| {
-        PathBuf::from(format!("fractal_{fractal}_{palette}_{width}x{height}.png"))
+        PathBuf::from(format!("fractal_{fractal}_{palette_name}_{width}x{height}.png"))
     });
 
     println!(
-        "Generating {fractal} ({width}x{height}, palette={palette}, max_iter={max_iter})"
+        "Generating {fractal} ({width}x{height}, palette={palette_name}, max_iter={max_iter})"
     );
     println!(
         "  Found interesting params in {:.2}s",
@@ -2616,6 +2613,16 @@ fn main() {
         anchors
     });
 
+    // Determine palette display name: custom file stem > palette enum name
+    let palette_name = if let Some(ref path) = cli.palette_file {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("custom")
+            .to_string()
+    } else {
+        String::new() // Will be filled per-generate call from the palette enum
+    };
+
     match cli.fractal {
         FractalType::All => {
             let types = [
@@ -2631,12 +2638,14 @@ fn main() {
             ];
             for ft in types {
                 let pal = cli.palette.unwrap_or_else(|| rng.choose(&ALL_PALETTES));
-                generate(ft, pal, cli.max_iter, cli.samples, cli.width, cli.height, cli.supersample, custom_palette.as_ref(), None, cli.save_params.as_ref(), &mut rng);
+                let name = if palette_name.is_empty() { pal.to_string() } else { palette_name.clone() };
+                generate(ft, pal, cli.max_iter, cli.samples, cli.width, cli.height, cli.supersample, custom_palette.as_ref(), &name, None, cli.save_params.as_ref(), &mut rng);
             }
         }
         ft => {
             let pal = cli.palette.unwrap_or_else(|| rng.choose(&ALL_PALETTES));
-            generate(ft, pal, cli.max_iter, cli.samples, cli.width, cli.height, cli.supersample, custom_palette.as_ref(), cli.output, cli.save_params.as_ref(), &mut rng);
+            let name = if palette_name.is_empty() { pal.to_string() } else { palette_name.clone() };
+            generate(ft, pal, cli.max_iter, cli.samples, cli.width, cli.height, cli.supersample, custom_palette.as_ref(), &name, cli.output, cli.save_params.as_ref(), &mut rng);
         }
     }
 }
