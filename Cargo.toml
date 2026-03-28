@@ -7,6 +7,8 @@ edition = "2021"
 image = "0.25"
 rayon = "1.10"
 clap = { version = "4", features = ["derive"] }
+wide = "0.7"
+bytemuck = "1"
 
 [profile.release]
 lto = true

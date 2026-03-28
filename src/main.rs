@@ -4,6 +4,7 @@ use rayon::prelude::*;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+use wide::{f64x4, CmpGt};
 
 const DEFAULT_WIDTH: u32 = 5440;
 const DEFAULT_HEIGHT: u32 = 1440;
@@ -676,6 +677,58 @@ fn find_interesting_newton(rng: &mut Rng, _max_iter: u32) -> FractalParams {
 
 // ── Fractal Computation (full image) ────────────────────────────────────────
 
+/// SIMD smooth iteration for 4 Mandelbrot pixels at once.
+/// Returns array of smooth iteration counts (0.0 = inside set).
+fn iterate_mandelbrot_4x(cr: f64x4, ci: f64x4, max_iter: u32) -> [f64; 4] {
+    let mut zr = f64x4::ZERO;
+    let mut zi = f64x4::ZERO;
+    let mut counts = [0u32; 4];
+    let mut done = [false; 4];
+    let threshold = f64x4::splat(65536.0);
+    let two = f64x4::splat(2.0);
+
+    for _ in 0..max_iter {
+        let zr2 = zr * zr;
+        let zi2 = zi * zi;
+        let mag2 = zr2 + zi2;
+
+        // Check escape for each lane
+        let escaped = mag2.cmp_gt(threshold);
+        let escaped_arr: [u64; 4] = bytemuck::cast(escaped);
+        for k in 0..4 {
+            if !done[k] {
+                if escaped_arr[k] != 0 {
+                    done[k] = true;
+                } else {
+                    counts[k] += 1;
+                }
+            }
+        }
+
+        if done[0] && done[1] && done[2] && done[3] {
+            break;
+        }
+
+        // z = z^2 + c (compute for all lanes — wasted work on escaped lanes is
+        // cheaper than branch mispredictions)
+        let new_zi = two * zr * zi + ci;
+        let new_zr = zr2 - zi2 + cr;
+        zr = new_zr;
+        zi = new_zi;
+    }
+
+    // Compute smooth coloring
+    let mag2_arr: [f64; 4] = bytemuck::cast(zr * zr + zi * zi);
+    let mut result = [0.0f64; 4];
+    for k in 0..4 {
+        if done[k] {
+            let mag = mag2_arr[k].sqrt();
+            result[k] = counts[k] as f64 + 1.0 - mag.ln().ln() / std::f64::consts::LN_2;
+        }
+    }
+    result
+}
+
 fn compute_mandelbrot(
     width: u32, height: u32,
     center: (f64, f64), zoom: f64, max_iter: u32,
@@ -689,18 +742,72 @@ fn compute_mandelbrot(
     let y_min = center.1 - y_range / 2.0;
     let x_step = x_range / width as f64;
     let y_step = y_range / height as f64;
+    let step4 = f64x4::from([0.0, 1.0, 2.0, 3.0]) * f64x4::splat(x_step);
 
     let mut result = vec![0.0f64; w * h];
     result
         .par_chunks_mut(w)
         .enumerate()
         .for_each(|(py, row)| {
-            let ci = y_min + py as f64 * y_step;
-            for px in 0..w {
+            let ci = f64x4::splat(y_min + py as f64 * y_step);
+            let mut px = 0;
+            // SIMD: process 4 pixels at a time
+            while px + 4 <= w {
+                let base_cr = x_min + px as f64 * x_step;
+                let cr = f64x4::splat(base_cr) + step4;
+                let vals = iterate_mandelbrot_4x(cr, ci, max_iter);
+                row[px..px + 4].copy_from_slice(&vals);
+                px += 4;
+            }
+            // Scalar remainder
+            while px < w {
                 let cr = x_min + px as f64 * x_step;
-                row[px] = iterate_mandelbrot(cr, ci, max_iter);
+                row[px] = iterate_mandelbrot(cr, y_min + py as f64 * y_step, max_iter);
+                px += 1;
             }
         });
+    result
+}
+
+/// SIMD smooth iteration for 4 Julia pixels at once.
+fn iterate_julia_4x(zr0: f64x4, zi0: f64x4, cr: f64x4, ci: f64x4, max_iter: u32) -> [f64; 4] {
+    let mut zr = zr0;
+    let mut zi = zi0;
+    let mut counts = [0u32; 4];
+    let mut done = [false; 4];
+    let threshold = f64x4::splat(65536.0);
+    let two = f64x4::splat(2.0);
+
+    for _ in 0..max_iter {
+        let zr2 = zr * zr;
+        let zi2 = zi * zi;
+        let mag2 = zr2 + zi2;
+        let escaped = mag2.cmp_gt(threshold);
+        let escaped_arr: [u64; 4] = bytemuck::cast(escaped);
+        for k in 0..4 {
+            if !done[k] {
+                if escaped_arr[k] != 0 {
+                    done[k] = true;
+                } else {
+                    counts[k] += 1;
+                }
+            }
+        }
+        if done[0] && done[1] && done[2] && done[3] { break; }
+        let new_zr = zr2 - zi2 + cr;
+        let new_zi = two * zr * zi + ci;
+        zr = new_zr;
+        zi = new_zi;
+    }
+
+    let mag2_arr: [f64; 4] = bytemuck::cast(zr * zr + zi * zi);
+    let mut result = [0.0f64; 4];
+    for k in 0..4 {
+        if done[k] {
+            let mag = mag2_arr[k].sqrt();
+            result[k] = counts[k] as f64 + 1.0 - mag.ln().ln() / std::f64::consts::LN_2;
+        }
+    }
     result
 }
 
@@ -717,18 +824,77 @@ fn compute_julia(
     let y_min = -y_range / 2.0;
     let x_step = x_range / width as f64;
     let y_step = y_range / height as f64;
+    let step4 = f64x4::from([0.0, 1.0, 2.0, 3.0]) * f64x4::splat(x_step);
+    let cr = f64x4::splat(c.0);
+    let ci = f64x4::splat(c.1);
 
     let mut result = vec![0.0f64; w * h];
     result
         .par_chunks_mut(w)
         .enumerate()
         .for_each(|(py, row)| {
-            for px in 0..w {
+            let zi0 = f64x4::splat(y_min + py as f64 * y_step);
+            let mut px = 0;
+            while px + 4 <= w {
+                let base_zr = x_min + px as f64 * x_step;
+                let zr0 = f64x4::splat(base_zr) + step4;
+                let vals = iterate_julia_4x(zr0, zi0, cr, ci, max_iter);
+                row[px..px + 4].copy_from_slice(&vals);
+                px += 4;
+            }
+            while px < w {
                 let zr = x_min + px as f64 * x_step;
                 let zi = y_min + py as f64 * y_step;
                 row[px] = iterate_julia(zr, zi, c.0, c.1, max_iter);
+                px += 1;
             }
         });
+    result
+}
+
+/// SIMD smooth iteration for 4 Burning Ship pixels at once.
+fn iterate_burning_ship_4x(cr: f64x4, ci: f64x4, max_iter: u32) -> [f64; 4] {
+    let mut zr = f64x4::ZERO;
+    let mut zi = f64x4::ZERO;
+    let mut counts = [0u32; 4];
+    let mut done = [false; 4];
+    let threshold = f64x4::splat(65536.0);
+    let two = f64x4::splat(2.0);
+
+    for _ in 0..max_iter {
+        let azr = zr.abs();
+        let azi = zi.abs();
+        let zr2 = azr * azr;
+        let zi2 = azi * azi;
+        let mag2 = zr2 + zi2;
+        let escaped = mag2.cmp_gt(threshold);
+        let escaped_arr: [u64; 4] = bytemuck::cast(escaped);
+        for k in 0..4 {
+            if !done[k] {
+                if escaped_arr[k] != 0 {
+                    done[k] = true;
+                } else {
+                    counts[k] += 1;
+                }
+            }
+        }
+        if done[0] && done[1] && done[2] && done[3] { break; }
+        let new_zi = two * azr * azi + ci;
+        let new_zr = zr2 - zi2 + cr;
+        zr = new_zr;
+        zi = new_zi;
+    }
+
+    let zr_final = zr;
+    let zi_final = zi;
+    let mag2_arr: [f64; 4] = bytemuck::cast(zr_final * zr_final + zi_final * zi_final);
+    let mut result = [0.0f64; 4];
+    for k in 0..4 {
+        if done[k] {
+            let mag = mag2_arr[k].sqrt();
+            result[k] = counts[k] as f64 + 1.0 - mag.ln().ln() / std::f64::consts::LN_2;
+        }
+    }
     result
 }
 
@@ -745,16 +911,26 @@ fn compute_burning_ship(
     let y_min = center.1 - y_range / 2.0;
     let x_step = x_range / width as f64;
     let y_step = y_range / height as f64;
+    let step4 = f64x4::from([0.0, 1.0, 2.0, 3.0]) * f64x4::splat(x_step);
 
     let mut result = vec![0.0f64; w * h];
     result
         .par_chunks_mut(w)
         .enumerate()
         .for_each(|(py, row)| {
-            let ci = y_min + py as f64 * y_step;
-            for px in 0..w {
+            let ci = f64x4::splat(y_min + py as f64 * y_step);
+            let mut px = 0;
+            while px + 4 <= w {
+                let base_cr = x_min + px as f64 * x_step;
+                let cr = f64x4::splat(base_cr) + step4;
+                let vals = iterate_burning_ship_4x(cr, ci, max_iter);
+                row[px..px + 4].copy_from_slice(&vals);
+                px += 4;
+            }
+            while px < w {
                 let cr = x_min + px as f64 * x_step;
-                row[px] = iterate_burning_ship(cr, ci, max_iter);
+                row[px] = iterate_burning_ship(cr, y_min + py as f64 * y_step, max_iter);
+                px += 1;
             }
         });
     result
