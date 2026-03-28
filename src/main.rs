@@ -7,6 +7,52 @@ use std::time::Instant;
 const WIDTH: u32 = 5440;
 const HEIGHT: u32 = 1440;
 
+// ── Simple PRNG (xoshiro256**) ──────────────────────────────────────────────
+
+struct Rng {
+    s: [u64; 4],
+}
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        let mut z = seed;
+        let mut s = [0u64; 4];
+        for slot in &mut s {
+            z = z.wrapping_add(0x9e3779b97f4a7c15);
+            let mut x = z;
+            x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+            *slot = x ^ (x >> 31);
+        }
+        Self { s }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let result = (self.s[1].wrapping_mul(5)).rotate_left(7).wrapping_mul(9);
+        let t = self.s[1] << 17;
+        self.s[2] ^= self.s[0];
+        self.s[3] ^= self.s[1];
+        self.s[1] ^= self.s[2];
+        self.s[0] ^= self.s[3];
+        self.s[2] ^= t;
+        self.s[3] = self.s[3].rotate_left(45);
+        result
+    }
+
+    fn f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn range(&mut self, lo: f64, hi: f64) -> f64 {
+        lo + self.f64() * (hi - lo)
+    }
+
+    fn choose<T: Copy>(&mut self, items: &[T]) -> T {
+        let idx = (self.next_u64() as usize) % items.len();
+        items[idx]
+    }
+}
+
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -16,7 +62,7 @@ struct Cli {
     #[arg(default_value = "mandelbrot")]
     fractal: FractalType,
 
-    /// Color palette
+    /// Color palette (random if not specified)
     #[arg(short, long)]
     palette: Option<Palette>,
 
@@ -27,9 +73,13 @@ struct Cli {
     /// Output file path
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Random seed (uses system time if not specified)
+    #[arg(short, long)]
+    seed: Option<u64>,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, ValueEnum, PartialEq)]
 enum FractalType {
     Mandelbrot,
     Julia,
@@ -47,6 +97,11 @@ enum Palette {
     Frost,
     Earth,
 }
+
+const ALL_PALETTES: [Palette; 6] = [
+    Palette::Twilight, Palette::Ocean, Palette::Fire,
+    Palette::Neon, Palette::Frost, Palette::Earth,
+];
 
 impl std::fmt::Display for FractalType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -140,14 +195,105 @@ fn build_colormap(palette: Palette, n: usize) -> Vec<[u8; 3]> {
         .collect()
 }
 
-fn default_palette(fractal: FractalType) -> Palette {
-    match fractal {
-        FractalType::Mandelbrot => Palette::Twilight,
-        FractalType::Julia => Palette::Neon,
-        FractalType::BurningShip => Palette::Fire,
-        FractalType::Newton => Palette::Ocean,
-        FractalType::All => Palette::Twilight,
+// ── Randomized Parameter Generation ─────────────────────────────────────────
+
+struct FractalParams {
+    center: (f64, f64),
+    zoom: f64,
+    julia_c: Option<(f64, f64)>,
+    color_offset: f64,
+}
+
+fn random_mandelbrot_params(rng: &mut Rng) -> FractalParams {
+    let locations: [(f64, f64, f64); 12] = [
+        (-0.75, 0.0, 1.0),
+        (-0.7435669, 0.1314023, 200.0),
+        (-0.7453, 0.1127, 500.0),
+        (-0.16, 1.0405, 50.0),
+        (-1.25066, 0.02012, 100.0),
+        (-0.235125, 0.827215, 200.0),
+        (0.001643721971153, 0.822467633298876, 1000.0),
+        (-1.749, 0.0, 1000.0),
+        (-0.74803, 0.06810, 300.0),
+        (-0.77568377, 0.13646737, 5000.0),
+        (-1.985424253345, -0.0000000032175, 50000.0),
+        (-0.1011, 0.9563, 30.0),
+    ];
+
+    let (cx, cy, base_zoom) = rng.choose(&locations);
+    let jitter = 0.1 / base_zoom;
+    let center = (
+        cx + rng.range(-jitter, jitter),
+        cy + rng.range(-jitter, jitter),
+    );
+    let zoom = base_zoom * rng.range(0.5, 2.0);
+
+    FractalParams { center, zoom, julia_c: None, color_offset: rng.f64() }
+}
+
+fn random_julia_params(rng: &mut Rng) -> FractalParams {
+    let constants: [(f64, f64); 14] = [
+        (-0.7269, 0.1889),
+        (-0.8, 0.156),
+        (-0.4, 0.6),
+        (0.285, 0.01),
+        (0.285, 0.013),
+        (-0.70176, -0.3842),
+        (-0.835, -0.2321),
+        (-0.1, 0.651),
+        (0.355, 0.355),
+        (-0.54, 0.54),
+        (0.37, 0.1),
+        (-0.12, -0.77),
+        (0.28, 0.008),
+        (-0.62, -0.44),
+    ];
+
+    let (cr, ci) = rng.choose(&constants);
+    let julia_c = (
+        cr + rng.range(-0.02, 0.02),
+        ci + rng.range(-0.02, 0.02),
+    );
+    let zoom = rng.range(0.8, 3.0);
+
+    FractalParams {
+        center: (0.0, 0.0),
+        zoom,
+        julia_c: Some(julia_c),
+        color_offset: rng.f64(),
     }
+}
+
+fn random_burning_ship_params(rng: &mut Rng) -> FractalParams {
+    let locations: [(f64, f64, f64, f64); 10] = [
+        (-1.755, -0.028, 20.0, 200.0),
+        (-1.762, -0.028, 50.0, 300.0),
+        (-1.78, -0.008, 10.0, 80.0),
+        (-1.74, -0.03, 15.0, 100.0),
+        (-1.77, -0.01, 20.0, 150.0),
+        (-1.76, -0.035, 30.0, 200.0),
+        (-1.7, -0.05, 3.0, 20.0),
+        (-1.755, -0.02, 40.0, 250.0),
+        (-1.765, -0.015, 30.0, 180.0),
+        (-0.515, -0.565, 20.0, 150.0),
+    ];
+
+    let (cx, cy, min_z, max_z) = rng.choose(&locations);
+    let zoom = 10.0f64.powf(rng.range(min_z.log10(), max_z.log10()));
+    let jitter = 0.5 / zoom;
+    let center = (
+        cx + rng.range(-jitter, jitter),
+        cy + rng.range(-jitter, jitter),
+    );
+
+    FractalParams { center, zoom, julia_c: None, color_offset: rng.f64() }
+}
+
+fn random_newton_params(rng: &mut Rng) -> FractalParams {
+    let center = (rng.range(-0.3, 0.3), rng.range(-0.3, 0.3));
+    let zoom = 10.0f64.powf(rng.range(0.3, 2.0));
+
+    FractalParams { center, zoom, julia_c: None, color_offset: rng.f64() }
 }
 
 // ── Fractal Computation ─────────────────────────────────────────────────────
@@ -293,19 +439,18 @@ fn compute_burning_ship(
 
 fn compute_newton(
     width: u32, height: u32,
-    zoom: f64, max_iter: u32,
+    center: (f64, f64), zoom: f64, max_iter: u32,
 ) -> Vec<f64> {
     let w = width as usize;
     let h = height as usize;
     let aspect = width as f64 / height as f64;
     let x_range = 4.0 / zoom;
     let y_range = x_range / aspect;
-    let x_min = -x_range / 2.0;
-    let y_min = -y_range / 2.0;
+    let x_min = center.0 - x_range / 2.0;
+    let y_min = center.1 - y_range / 2.0;
     let x_step = x_range / width as f64;
     let y_step = y_range / height as f64;
 
-    // Roots of z^3 - 1 = 0
     let roots: [(f64, f64); 3] = [
         (1.0, 0.0),
         (-0.5, 0.866_025_403_784_438_6),
@@ -325,23 +470,14 @@ fn compute_newton(
                 let mut shade = 0u32;
 
                 for i in 0..max_iter {
-                    // f(z) = z^3 - 1, f'(z) = 3z^2
                     let zr2 = zr * zr;
                     let zi2 = zi * zi;
-
-                    // z^2
                     let z2r = zr2 - zi2;
                     let z2i = 2.0 * zr * zi;
-
-                    // z^3
                     let z3r = z2r * zr - z2i * zi;
                     let z3i = z2r * zi + z2i * zr;
-
-                    // f'(z) = 3z^2
                     let dr = 3.0 * z2r;
                     let di = 3.0 * z2i;
-
-                    // Complex division: (z^3 - 1) / (3z^2)
                     let denom = dr * dr + di * di;
                     if denom < 1e-24 {
                         break;
@@ -350,7 +486,6 @@ fn compute_newton(
                     let fi = z3i;
                     let qr = (fr * dr + fi * di) / denom;
                     let qi = (fi * dr - fr * di) / denom;
-
                     zr -= qr;
                     zi -= qi;
 
@@ -382,9 +517,10 @@ fn compute_newton(
 
 // ── Rendering ───────────────────────────────────────────────────────────────
 
-fn render(data: &[f64], width: u32, height: u32, palette: Palette) -> RgbImage {
+fn render(data: &[f64], width: u32, height: u32, palette: Palette, color_offset: f64) -> RgbImage {
     let cmap = build_colormap(palette, 2048);
     let cmap_len = cmap.len();
+    let offset = (color_offset * cmap_len as f64) as usize;
 
     let d_max = data
         .iter()
@@ -400,8 +536,7 @@ fn render(data: &[f64], width: u32, height: u32, palette: Palette) -> RgbImage {
                 [0, 0, 0]
             } else {
                 let normed = val / d_max;
-                let idx = ((normed * 12.0 * cmap_len as f64) % cmap_len as f64) as usize;
-                let idx = idx.min(cmap_len - 1);
+                let idx = ((normed * 12.0 * cmap_len as f64) as usize + offset) % cmap_len;
                 cmap[idx]
             }
         })
@@ -418,35 +553,57 @@ fn render(data: &[f64], width: u32, height: u32, palette: Palette) -> RgbImage {
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
-fn generate(fractal: FractalType, palette: Palette, max_iter: u32, output: Option<PathBuf>) {
+fn generate(
+    fractal: FractalType,
+    palette: Palette,
+    max_iter: u32,
+    output: Option<PathBuf>,
+    rng: &mut Rng,
+) {
+    let params = match fractal {
+        FractalType::Mandelbrot => random_mandelbrot_params(rng),
+        FractalType::Julia => random_julia_params(rng),
+        FractalType::BurningShip => random_burning_ship_params(rng),
+        FractalType::Newton => random_newton_params(rng),
+        FractalType::All => unreachable!(),
+    };
+
     let out_path = output.unwrap_or_else(|| {
         PathBuf::from(format!("fractal_{fractal}_{palette}_{WIDTH}x{HEIGHT}.png"))
     });
 
     println!(
-        "Generating {fractal} ({WIDTH}x{HEIGHT}, palette={palette}, max_iter={max_iter})..."
+        "Generating {fractal} ({WIDTH}x{HEIGHT}, palette={palette}, max_iter={max_iter})"
     );
+    println!(
+        "  center=({:.6}, {:.6}), zoom={:.1}",
+        params.center.0, params.center.1, params.zoom
+    );
+    if let Some(c) = params.julia_c {
+        println!("  julia c=({:.6}, {:.6})", c.0, c.1);
+    }
 
     let t0 = Instant::now();
     let data = match fractal {
         FractalType::Mandelbrot => {
-            compute_mandelbrot(WIDTH, HEIGHT, (-0.75, 0.0), 1.0, max_iter)
+            compute_mandelbrot(WIDTH, HEIGHT, params.center, params.zoom, max_iter)
         }
         FractalType::Julia => {
-            compute_julia(WIDTH, HEIGHT, (-0.7269, 0.1889), 1.0, max_iter)
+            let c = params.julia_c.unwrap();
+            compute_julia(WIDTH, HEIGHT, c, params.zoom, max_iter)
         }
         FractalType::BurningShip => {
-            compute_burning_ship(WIDTH, HEIGHT, (-1.75, -0.04), 30.0, max_iter)
+            compute_burning_ship(WIDTH, HEIGHT, params.center, params.zoom, max_iter)
         }
         FractalType::Newton => {
-            compute_newton(WIDTH, HEIGHT, 1.0, max_iter.min(500))
+            compute_newton(WIDTH, HEIGHT, params.center, params.zoom, max_iter.min(500))
         }
         FractalType::All => unreachable!(),
     };
     let t1 = Instant::now();
     println!("  Computed in {:.2}s", (t1 - t0).as_secs_f64());
 
-    let img = render(&data, WIDTH, HEIGHT, palette);
+    let img = render(&data, WIDTH, HEIGHT, palette, params.color_offset);
     img.save(&out_path).expect("Failed to save image");
     let t2 = Instant::now();
     println!(
@@ -459,6 +616,15 @@ fn generate(fractal: FractalType, palette: Palette, max_iter: u32, output: Optio
 fn main() {
     let cli = Cli::parse();
 
+    let seed = cli.seed.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    });
+    println!("Seed: {seed}");
+    let mut rng = Rng::new(seed);
+
     match cli.fractal {
         FractalType::All => {
             let types = [
@@ -468,13 +634,13 @@ fn main() {
                 FractalType::Newton,
             ];
             for ft in types {
-                let pal = cli.palette.unwrap_or_else(|| default_palette(ft));
-                generate(ft, pal, cli.max_iter, None);
+                let pal = cli.palette.unwrap_or_else(|| rng.choose(&ALL_PALETTES));
+                generate(ft, pal, cli.max_iter, None, &mut rng);
             }
         }
         ft => {
-            let pal = cli.palette.unwrap_or_else(|| default_palette(ft));
-            generate(ft, pal, cli.max_iter, cli.output);
+            let pal = cli.palette.unwrap_or_else(|| rng.choose(&ALL_PALETTES));
+            generate(ft, pal, cli.max_iter, cli.output, &mut rng);
         }
     }
 }
