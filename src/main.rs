@@ -1180,6 +1180,16 @@ fn score_attractor_params(a: f64, b: f64, c: f64, d: f64, at: AttractorType) -> 
         return 0.0; // Fixed point or tiny orbit
     }
 
+    // Prefer attractors whose aspect ratio is wider (fills ultra-wide better)
+    let bbox_aspect = bbox_w / bbox_h;
+    let aspect_score = if bbox_aspect > 2.0 {
+        1.0 // Wide — great for ultra-wide displays
+    } else if bbox_aspect > 1.0 {
+        0.7
+    } else {
+        0.3 // Taller than wide — lots of wasted space on sides
+    };
+
     // Accumulate into a small probe histogram
     let aspect = probe_w as f64 / probe_h as f64;
     let (vw, vh) = if bbox_w / bbox_h > aspect {
@@ -1249,10 +1259,10 @@ fn score_attractor_params(a: f64, b: f64, c: f64, d: f64, at: AttractorType) -> 
     let spread_score = match quarters_active {
         4 => 1.0,
         3 => 0.6,
-        _ => 0.1,
+        _ => 0.05,
     };
 
-    fill_score * 0.5 + spread_score * 0.5
+    fill_score * 0.30 + spread_score * 0.40 + aspect_score * 0.30
 }
 
 fn find_interesting_attractor(rng: &mut Rng) -> FractalParams {
