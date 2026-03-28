@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-const WIDTH: u32 = 5440;
-const HEIGHT: u32 = 1440;
+const DEFAULT_WIDTH: u32 = 5440;
+const DEFAULT_HEIGHT: u32 = 1440;
 
 // ── Simple PRNG (xoshiro256**) ──────────────────────────────────────────────
 
@@ -82,6 +82,14 @@ struct Cli {
     /// Number of samples for histogram-based fractals (flame, buddhabrot, attractor)
     #[arg(long)]
     samples: Option<u64>,
+
+    /// Image width in pixels
+    #[arg(long, default_value_t = DEFAULT_WIDTH)]
+    width: u32,
+
+    /// Image height in pixels
+    #[arg(long, default_value_t = DEFAULT_HEIGHT)]
+    height: u32,
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq)]
@@ -363,8 +371,10 @@ fn score_viewport(
     zoom: f64,
     max_iter: u32,
     iterate_fn: &dyn Fn(f64, f64, u32) -> f64,
+    width: u32,
+    height: u32,
 ) -> f64 {
-    let aspect = WIDTH as f64 / HEIGHT as f64;
+    let aspect = width as f64 / height as f64;
     let x_range = 3.5 / zoom;
     let y_range = x_range / aspect;
     let x_min = center.0 - x_range / 2.0;
@@ -495,7 +505,7 @@ impl Default for FractalParams {
     }
 }
 
-fn find_interesting_mandelbrot(rng: &mut Rng, max_iter: u32) -> FractalParams {
+fn find_interesting_mandelbrot(rng: &mut Rng, max_iter: u32, width: u32, height: u32) -> FractalParams {
     let mut best_params = FractalParams {
         center: (-0.75, 0.0),
         color_offset: rng.f64(),
@@ -519,6 +529,7 @@ fn find_interesting_mandelbrot(rng: &mut Rng, max_iter: u32) -> FractalParams {
         let score = score_viewport(
             boundary, zoom, max_iter,
             &|x, y, mi| iterate_mandelbrot(x, y, mi),
+            width, height,
         );
 
         if score > best_score {
@@ -539,7 +550,7 @@ fn find_interesting_mandelbrot(rng: &mut Rng, max_iter: u32) -> FractalParams {
     best_params
 }
 
-fn find_interesting_julia(rng: &mut Rng, max_iter: u32) -> FractalParams {
+fn find_interesting_julia(rng: &mut Rng, max_iter: u32, width: u32, height: u32) -> FractalParams {
     let mut best_params = FractalParams {
         julia_c: Some((-0.7269, 0.1889)),
         color_offset: rng.f64(),
@@ -567,6 +578,7 @@ fn find_interesting_julia(rng: &mut Rng, max_iter: u32) -> FractalParams {
         let score = score_viewport(
             (0.0, 0.0), zoom, max_iter,
             &|x, y, mi| iterate_julia(x, y, c.0, c.1, mi),
+            width, height,
         );
 
         if score > best_score {
@@ -587,7 +599,7 @@ fn find_interesting_julia(rng: &mut Rng, max_iter: u32) -> FractalParams {
     best_params
 }
 
-fn find_interesting_burning_ship(rng: &mut Rng, max_iter: u32) -> FractalParams {
+fn find_interesting_burning_ship(rng: &mut Rng, max_iter: u32, width: u32, height: u32) -> FractalParams {
     let mut best_params = FractalParams {
         center: (-1.75, -0.04),
         zoom: 30.0,
@@ -627,6 +639,7 @@ fn find_interesting_burning_ship(rng: &mut Rng, max_iter: u32) -> FractalParams 
         let score = score_viewport(
             center, zoom, max_iter,
             &|x, y, mi| iterate_burning_ship(x, y, mi),
+            width, height,
         );
 
         if score > best_score {
@@ -1535,15 +1548,17 @@ fn generate(
     palette: Palette,
     max_iter: u32,
     samples: Option<u64>,
+    width: u32,
+    height: u32,
     output: Option<PathBuf>,
     rng: &mut Rng,
 ) {
     let seed = rng.next_u64();
     let t_search = Instant::now();
     let mut params = match fractal {
-        FractalType::Mandelbrot => find_interesting_mandelbrot(rng, max_iter),
-        FractalType::Julia => find_interesting_julia(rng, max_iter),
-        FractalType::BurningShip => find_interesting_burning_ship(rng, max_iter),
+        FractalType::Mandelbrot => find_interesting_mandelbrot(rng, max_iter, width, height),
+        FractalType::Julia => find_interesting_julia(rng, max_iter, width, height),
+        FractalType::BurningShip => find_interesting_burning_ship(rng, max_iter, width, height),
         FractalType::Newton => find_interesting_newton(rng, max_iter),
         FractalType::Flame => find_interesting_flame(rng),
         FractalType::Buddhabrot => find_interesting_buddhabrot(rng),
@@ -1558,11 +1573,11 @@ fn generate(
     }
 
     let out_path = output.unwrap_or_else(|| {
-        PathBuf::from(format!("fractal_{fractal}_{palette}_{WIDTH}x{HEIGHT}.png"))
+        PathBuf::from(format!("fractal_{fractal}_{palette}_{width}x{height}.png"))
     });
 
     println!(
-        "Generating {fractal} ({WIDTH}x{HEIGHT}, palette={palette}, max_iter={max_iter})"
+        "Generating {fractal} ({width}x{height}, palette={palette}, max_iter={max_iter})"
     );
     println!(
         "  Found interesting params in {:.2}s",
@@ -1572,37 +1587,37 @@ fn generate(
     let t0 = Instant::now();
     let img = match fractal {
         FractalType::Mandelbrot => {
-            let data = compute_mandelbrot(WIDTH, HEIGHT, params.center, params.zoom, max_iter);
-            render(&data, WIDTH, HEIGHT, palette, params.color_offset, 12.0)
+            let data = compute_mandelbrot(width, height, params.center, params.zoom, max_iter);
+            render(&data, width, height, palette, params.color_offset, 12.0)
         }
         FractalType::Julia => {
             let c = params.julia_c.unwrap();
-            let data = compute_julia(WIDTH, HEIGHT, c, params.zoom, max_iter);
-            render(&data, WIDTH, HEIGHT, palette, params.color_offset, 12.0)
+            let data = compute_julia(width, height, c, params.zoom, max_iter);
+            render(&data, width, height, palette, params.color_offset, 12.0)
         }
         FractalType::BurningShip => {
-            let data = compute_burning_ship(WIDTH, HEIGHT, params.center, params.zoom, max_iter);
-            render(&data, WIDTH, HEIGHT, palette, params.color_offset, 12.0)
+            let data = compute_burning_ship(width, height, params.center, params.zoom, max_iter);
+            render(&data, width, height, palette, params.color_offset, 12.0)
         }
         FractalType::Newton => {
-            let data = compute_newton(WIDTH, HEIGHT, params.center, params.zoom, max_iter.min(500));
-            render(&data, WIDTH, HEIGHT, palette, params.color_offset, 12.0)
+            let data = compute_newton(width, height, params.center, params.zoom, max_iter.min(500));
+            render(&data, width, height, palette, params.color_offset, 12.0)
         }
         FractalType::StrangeAttractor => {
             let (a, b, c, d) = params.attractor_params.unwrap();
             let at = params.attractor_type.unwrap();
-            let data = compute_attractor(WIDTH, HEIGHT, a, b, c, d, at, params.samples, seed);
-            render(&data, WIDTH, HEIGHT, palette, params.color_offset, 2.0)
+            let data = compute_attractor(width, height, a, b, c, d, at, params.samples, seed);
+            render(&data, width, height, palette, params.color_offset, 2.0)
         }
         FractalType::Buddhabrot => {
             let (ri, gi, bi) = params.buddhabrot_iters.unwrap();
-            let (r, g, b) = compute_buddhabrot(WIDTH, HEIGHT, params.samples, ri, gi, bi, seed);
-            render_buddhabrot(&r, &g, &b, WIDTH, HEIGHT)
+            let (r, g, b) = compute_buddhabrot(width, height, params.samples, ri, gi, bi, seed);
+            render_buddhabrot(&r, &g, &b, width, height)
         }
         FractalType::Flame => {
             let transforms = params.flame_transforms.as_ref().unwrap();
-            let data = compute_flame(WIDTH, HEIGHT, transforms, params.samples, seed);
-            render(&data, WIDTH, HEIGHT, palette, params.color_offset, 2.0)
+            let data = compute_flame(width, height, transforms, params.samples, seed);
+            render(&data, width, height, palette, params.color_offset, 2.0)
         }
         FractalType::All => unreachable!(),
     };
@@ -1643,12 +1658,12 @@ fn main() {
             ];
             for ft in types {
                 let pal = cli.palette.unwrap_or_else(|| rng.choose(&ALL_PALETTES));
-                generate(ft, pal, cli.max_iter, cli.samples, None, &mut rng);
+                generate(ft, pal, cli.max_iter, cli.samples, cli.width, cli.height, None, &mut rng);
             }
         }
         ft => {
             let pal = cli.palette.unwrap_or_else(|| rng.choose(&ALL_PALETTES));
-            generate(ft, pal, cli.max_iter, cli.samples, cli.output, &mut rng);
+            generate(ft, pal, cli.max_iter, cli.samples, cli.width, cli.height, cli.output, &mut rng);
         }
     }
 }
