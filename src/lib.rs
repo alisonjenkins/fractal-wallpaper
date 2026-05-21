@@ -1575,40 +1575,55 @@ pub fn compute_attractor(
     let vx_min = x_center - view_w / 2.0;
     let vy_min = y_center - view_h / 2.0;
 
-    let histogram = Histogram::new(width, height);
+    let n = (width as usize) * (height as usize);
     let num_threads = rayon::current_num_threads().max(1);
     let samples_per_thread = samples / num_threads as u64;
+    let w_i64 = width as i64;
+    let h_i64 = height as i64;
+    let w_usize = width as usize;
 
-    (0..num_threads).into_par_iter().for_each(|tid| {
-        let mut rng = Rng::new(rng_seed.wrapping_add((tid as u64).wrapping_mul(0x9e3779b97f4a7c15)));
-        let mut x = rng.range(-0.1, 0.1);
-        let mut y = rng.range(-0.1, 0.1);
+    // Per-thread local histograms (u32 bins; per-thread sample count fits)
+    // avoid atomic contention that dominates with shared AtomicU64 bins.
+    let merged = (0..num_threads).into_par_iter()
+        .map(|tid| {
+            let mut local = vec![0u32; n];
+            let mut rng = Rng::new(rng_seed.wrapping_add((tid as u64).wrapping_mul(0x9e3779b97f4a7c15)));
+            let mut x = rng.range(-0.1, 0.1);
+            let mut y = rng.range(-0.1, 0.1);
 
-        for i in 0..samples_per_thread {
-            let (xn, yn) = match at {
-                AttractorType::Clifford => (
-                    (a * y).sin() + c * (a * x).cos(),
-                    (b * x).sin() + d * (b * y).cos(),
-                ),
-                AttractorType::DeJong => (
-                    (a * y).sin() - (b * x).cos(),
-                    (c * x).sin() - (d * y).cos(),
-                ),
-            };
-            x = xn;
-            y = yn;
+            for i in 0..samples_per_thread {
+                let (xn, yn) = match at {
+                    AttractorType::Clifford => (
+                        (a * y).sin() + c * (a * x).cos(),
+                        (b * x).sin() + d * (b * y).cos(),
+                    ),
+                    AttractorType::DeJong => (
+                        (a * y).sin() - (b * x).cos(),
+                        (c * x).sin() - (d * y).cos(),
+                    ),
+                };
+                x = xn;
+                y = yn;
 
-            if i < 100 { continue; }
+                if i < 100 { continue; }
 
-            let px = ((x - vx_min) / view_w * width as f64) as i64;
-            let py = ((y - vy_min) / view_h * height as f64) as i64;
-            if px >= 0 && px < width as i64 && py >= 0 && py < height as i64 {
-                histogram.increment(px as u32, py as u32);
+                let px = ((x - vx_min) / view_w * width as f64) as i64;
+                let py = ((y - vy_min) / view_h * height as f64) as i64;
+                if px >= 0 && px < w_i64 && py >= 0 && py < h_i64 {
+                    local[py as usize * w_usize + px as usize] += 1;
+                }
             }
-        }
-    });
+            local
+        })
+        .reduce(|| vec![0u32; n], |mut a, b| {
+            for (ai, bi) in a.iter_mut().zip(b.iter()) {
+                *ai += *bi;
+            }
+            a
+        });
 
-    tone_map_log(&histogram.to_vec_f64())
+    let as_f64: Vec<f64> = merged.iter().map(|&v| v as f64).collect();
+    tone_map_log(&as_f64)
 }
 
 fn score_attractor_params(a: f64, b: f64, c: f64, d: f64, at: AttractorType) -> f64 {
@@ -1790,89 +1805,92 @@ pub fn compute_buddhabrot(
     r_iter: u32, g_iter: u32, b_iter: u32,
     rng_seed: u64,
 ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let hist_r = Histogram::new(width, height);
-    let hist_g = Histogram::new(width, height);
-    let hist_b = Histogram::new(width, height);
-
+    let n = (width as usize) * (height as usize);
     let num_threads = rayon::current_num_threads().max(1);
     let samples_per_thread = samples / num_threads as u64;
     let max_channel_iter = r_iter.max(g_iter).max(b_iter);
+    let w_usize = width as usize;
+    let w_i64 = width as i64;
+    let h_i64 = height as i64;
 
-    // The viewable region: centered on the Mandelbrot set, stretched for ultra-wide
     let view_x_min = -2.5;
     let view_x_max = 1.5;
     let view_y_range = (view_x_max - view_x_min) / (width as f64 / height as f64);
     let view_y_min = -view_y_range / 2.0;
 
-    (0..num_threads).into_par_iter().for_each(|tid| {
-        let mut rng = Rng::new(rng_seed.wrapping_add((tid as u64).wrapping_mul(0x9e3779b97f4a7c15)));
-        let mut orbit = Vec::with_capacity(max_channel_iter as usize);
+    // Per-thread local R/G/B histograms — drops AtomicU64 contention.
+    let (hist_r, hist_g, hist_b) = (0..num_threads).into_par_iter()
+        .map(|tid| {
+            let mut hr = vec![0u32; n];
+            let mut hg = vec![0u32; n];
+            let mut hb = vec![0u32; n];
+            let mut rng = Rng::new(rng_seed.wrapping_add((tid as u64).wrapping_mul(0x9e3779b97f4a7c15)));
+            let mut orbit = Vec::with_capacity(max_channel_iter as usize);
 
-        // Metropolis-Hastings: start from a known escaping point near the boundary
-        let mut cur_cr = -0.75;
-        let mut cur_ci = 0.1;
-        let step_size = 0.01;
+            let mut cur_cr = -0.75;
+            let mut cur_ci = 0.1;
+            let step_size = 0.01;
 
-        for sample_idx in 0..samples_per_thread {
-            // Propose a new point (random walk from current, or uniform random every 100 steps)
-            let (cr, ci) = if sample_idx % 100 == 0 {
-                // Periodic uniform random to avoid getting stuck
-                (rng.range(-2.0, 1.0), rng.range(-1.5, 1.5))
-            } else {
-                (
-                    cur_cr + rng.range(-step_size, step_size),
-                    cur_ci + rng.range(-step_size, step_size),
-                )
-            };
+            for sample_idx in 0..samples_per_thread {
+                let (cr, ci) = if sample_idx % 100 == 0 {
+                    (rng.range(-2.0, 1.0), rng.range(-1.5, 1.5))
+                } else {
+                    (
+                        cur_cr + rng.range(-step_size, step_size),
+                        cur_ci + rng.range(-step_size, step_size),
+                    )
+                };
 
-            // Skip points known to be inside the cardioid/bulb
-            if in_cardioid_or_bulb(cr, ci) { continue; }
+                if in_cardioid_or_bulb(cr, ci) { continue; }
 
-            // Check if point escapes
-            let mut zr = 0.0;
-            let mut zi = 0.0;
-            let mut escaped = false;
+                let mut zr = 0.0;
+                let mut zi = 0.0;
+                let mut escaped = false;
 
-            orbit.clear();
-            for _ in 0..max_channel_iter {
-                let zr2 = zr * zr;
-                let zi2 = zi * zi;
-                if zr2 + zi2 > 4.0 {
-                    escaped = true;
-                    break;
+                orbit.clear();
+                for _ in 0..max_channel_iter {
+                    let zr2 = zr * zr;
+                    let zi2 = zi * zi;
+                    if zr2 + zi2 > 4.0 {
+                        escaped = true;
+                        break;
+                    }
+                    orbit.push((zr, zi));
+                    zi = 2.0 * zr * zi + ci;
+                    zr = zr2 - zi2 + cr;
                 }
-                orbit.push((zr, zi));
-                zi = 2.0 * zr * zi + ci;
-                zr = zr2 - zi2 + cr;
-            }
 
-            if !escaped { continue; }
+                if !escaped { continue; }
 
-            // Accept the proposed point for future random walks
-            cur_cr = cr;
-            cur_ci = ci;
+                cur_cr = cr;
+                cur_ci = ci;
 
-            // Accumulate orbit into histograms
-            for (i, &(ozr, ozi)) in orbit.iter().enumerate() {
-                let px = ((ozr - view_x_min) / (view_x_max - view_x_min) * width as f64) as i64;
-                let py = ((ozi - view_y_min) / view_y_range * height as f64) as i64;
-                if px >= 0 && px < width as i64 && py >= 0 && py < height as i64 {
-                    let ui = i as u32;
-                    if ui < b_iter {
-                        hist_b.increment(px as u32, py as u32);
-                    }
-                    if ui < g_iter {
-                        hist_g.increment(px as u32, py as u32);
-                    }
-                    if ui < r_iter {
-                        hist_r.increment(px as u32, py as u32);
+                for (i, &(ozr, ozi)) in orbit.iter().enumerate() {
+                    let px = ((ozr - view_x_min) / (view_x_max - view_x_min) * width as f64) as i64;
+                    let py = ((ozi - view_y_min) / view_y_range * height as f64) as i64;
+                    if px >= 0 && px < w_i64 && py >= 0 && py < h_i64 {
+                        let idx = py as usize * w_usize + px as usize;
+                        let ui = i as u32;
+                        if ui < b_iter { hb[idx] += 1; }
+                        if ui < g_iter { hg[idx] += 1; }
+                        if ui < r_iter { hr[idx] += 1; }
                     }
                 }
             }
-        }
-    });
+            (hr, hg, hb)
+        })
+        .reduce(
+            || (vec![0u32; n], vec![0u32; n], vec![0u32; n]),
+            |(mut ar, mut ag, mut ab), (br, bg, bb)| {
+                for (a, b) in ar.iter_mut().zip(br.iter()) { *a += *b; }
+                for (a, b) in ag.iter_mut().zip(bg.iter()) { *a += *b; }
+                for (a, b) in ab.iter_mut().zip(bb.iter()) { *a += *b; }
+                (ar, ag, ab)
+            },
+        );
 
-    (hist_r.to_vec_f64(), hist_g.to_vec_f64(), hist_b.to_vec_f64())
+    let to_f64 = |v: Vec<u32>| -> Vec<f64> { v.iter().map(|&x| x as f64).collect() };
+    (to_f64(hist_r), to_f64(hist_g), to_f64(hist_b))
 }
 
 pub fn render_buddhabrot(
@@ -2035,75 +2053,79 @@ pub fn compute_flame(
         .collect();
 
     let n = (width as usize) * (height as usize);
-    let histogram = Histogram::new(width, height);
-    // Accumulate color indices using atomic u64 (fixed-point: value * 1_000_000)
-    let color_acc: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
     let num_threads = rayon::current_num_threads().max(1);
     let samples_per_thread = samples / num_threads as u64;
+    let w_usize = width as usize;
+    let w_i64 = width as i64;
+    let h_i64 = height as i64;
 
-    (0..num_threads).into_par_iter().for_each(|tid| {
-        let mut rng = Rng::new(rng_seed.wrapping_add((tid as u64).wrapping_mul(0x9e3779b97f4a7c15)));
-        let mut x = rng.range(-1.0, 1.0);
-        let mut y = rng.range(-1.0, 1.0);
-        let mut color_idx = 0.5f64;
+    // Per-thread local accumulators — eliminates AtomicU64 contention.
+    // color_local is fixed-point (value * 1_000_000) summed as u64.
+    let (hist_u32, color_u64) = (0..num_threads).into_par_iter()
+        .map(|tid| {
+            let mut hist = vec![0u32; n];
+            let mut color = vec![0u64; n];
+            let mut rng = Rng::new(rng_seed.wrapping_add((tid as u64).wrapping_mul(0x9e3779b97f4a7c15)));
+            let mut x = rng.range(-1.0, 1.0);
+            let mut y = rng.range(-1.0, 1.0);
+            let mut color_idx = 0.5f64;
 
-        for i in 0..samples_per_thread {
-            // Select transform by weight
-            let r = rng.f64();
-            let mut chosen = 0;
-            for (j, &cw) in cum_weights.iter().enumerate() {
-                if r <= cw {
-                    chosen = j;
-                    break;
+            for i in 0..samples_per_thread {
+                let r = rng.f64();
+                let mut chosen = 0;
+                for (j, &cw) in cum_weights.iter().enumerate() {
+                    if r <= cw {
+                        chosen = j;
+                        break;
+                    }
+                }
+                let t = &transforms[chosen];
+
+                let ax = t.a * x + t.b * y + t.c;
+                let ay = t.d * x + t.e * y + t.f;
+                let (vx, vy) = apply_variations(ax, ay, &t.variations);
+                x = vx;
+                y = vy;
+                color_idx = (color_idx + t.color) / 2.0;
+
+                if !x.is_finite() || !y.is_finite() || x.abs() > 1e10 || y.abs() > 1e10 {
+                    x = rng.range(-1.0, 1.0);
+                    y = rng.range(-1.0, 1.0);
+                    color_idx = 0.5;
+                    continue;
+                }
+
+                if i < 20 { continue; } // Warmup
+
+                let px = ((x + 2.5) / 5.0 * width as f64) as i64;
+                let py = ((y + 1.5) / 3.0 * height as f64) as i64;
+                if px >= 0 && px < w_i64 && py >= 0 && py < h_i64 {
+                    let idx = py as usize * w_usize + px as usize;
+                    hist[idx] += 1;
+                    color[idx] += (color_idx * 1_000_000.0) as u64;
                 }
             }
-            let t = &transforms[chosen];
+            (hist, color)
+        })
+        .reduce(
+            || (vec![0u32; n], vec![0u64; n]),
+            |(mut ah, mut ac), (bh, bc)| {
+                for (ai, bi) in ah.iter_mut().zip(bh.iter()) { *ai += *bi; }
+                for (ai, bi) in ac.iter_mut().zip(bc.iter()) { *ai += *bi; }
+                (ah, ac)
+            },
+        );
 
-            // Apply affine transform
-            let ax = t.a * x + t.b * y + t.c;
-            let ay = t.d * x + t.e * y + t.f;
+    let raw_density: Vec<f64> = hist_u32.iter().map(|&v| v as f64).collect();
+    let density = tone_map_log(&raw_density);
 
-            // Apply variation functions
-            let (vx, vy) = apply_variations(ax, ay, &t.variations);
-            x = vx;
-            y = vy;
-
-            // Blend color index with transform's color
-            color_idx = (color_idx + t.color) / 2.0;
-
-            // Divergence guard
-            if !x.is_finite() || !y.is_finite() || x.abs() > 1e10 || y.abs() > 1e10 {
-                x = rng.range(-1.0, 1.0);
-                y = rng.range(-1.0, 1.0);
-                color_idx = 0.5;
-                continue;
-            }
-
-            if i < 20 { continue; } // Warmup
-
-            // Map to pixel — flame coordinates typically in [-2, 2]
-            let px = ((x + 2.5) / 5.0 * width as f64) as i64;
-            let py = ((y + 1.5) / 3.0 * height as f64) as i64;
-            if px >= 0 && px < width as i64 && py >= 0 && py < height as i64 {
-                let idx = py as usize * width as usize + px as usize;
-                histogram.increment(px as u32, py as u32);
-                // Fixed-point color accumulation
-                color_acc[idx].fetch_add((color_idx * 1_000_000.0) as u64, Ordering::Relaxed);
-            }
-        }
-    });
-
-    let density = tone_map_log(&histogram.to_vec_f64());
-    let raw_density = histogram.to_vec_f64();
-
-    // Compute average color index per pixel
-    let color_map: Vec<f64> = color_acc
+    let color_map: Vec<f64> = color_u64
         .iter()
         .enumerate()
-        .map(|(i, c)| {
+        .map(|(i, &c)| {
             let count = raw_density[i];
             if count > 0.0 {
-                (c.load(Ordering::Relaxed) as f64 / 1_000_000.0) / count
+                (c as f64 / 1_000_000.0) / count
             } else {
                 0.0
             }
