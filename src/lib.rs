@@ -1683,6 +1683,139 @@ pub fn compute_newton(
 
 // ── Tricorn / Mandelbar ─────────────────────────────────────────────────────
 
+/// SIMD smooth iteration for 4 Tricorn pixels at once.
+/// Tricorn iterates z = conj(z)^2 + c, i.e. new_zi gets a sign flip.
+#[cfg(target_arch = "aarch64")]
+fn iterate_tricorn_4x(cr_v: f64x4, ci_v: f64x4, max_iter: u32) -> [f64; 4] {
+    use core::arch::aarch64::*;
+
+    let cr_arr: [f64; 4] = bytemuck::cast(cr_v);
+    let ci_arr: [f64; 4] = bytemuck::cast(ci_v);
+
+    unsafe {
+        let cr_a = vld1q_f64(cr_arr.as_ptr());
+        let cr_b = vld1q_f64(cr_arr.as_ptr().add(2));
+        let ci_a = vld1q_f64(ci_arr.as_ptr());
+        let ci_b = vld1q_f64(ci_arr.as_ptr().add(2));
+        let threshold = vdupq_n_f64(65536.0);
+        let one_bits = vdupq_n_u64(0x3FF0000000000000);
+        let zero_f = vdupq_n_f64(0.0);
+
+        let mut zr_a = zero_f;
+        let mut zi_a = zero_f;
+        let mut zr_b = zero_f;
+        let mut zi_b = zero_f;
+        let mut counts_a = zero_f;
+        let mut counts_b = zero_f;
+        let mut done_a = vreinterpretq_u64_f64(zero_f);
+        let mut done_b = vreinterpretq_u64_f64(zero_f);
+
+        for _ in 0..max_iter {
+            let zr2_a = vmulq_f64(zr_a, zr_a);
+            let zi2_a = vmulq_f64(zi_a, zi_a);
+            let mag2_a = vaddq_f64(zr2_a, zi2_a);
+            let esc_a = vcgtq_f64(mag2_a, threshold);
+
+            let zr2_b = vmulq_f64(zr_b, zr_b);
+            let zi2_b = vmulq_f64(zi_b, zi_b);
+            let mag2_b = vaddq_f64(zr2_b, zi2_b);
+            let esc_b = vcgtq_f64(mag2_b, threshold);
+
+            let active_a = vreinterpretq_u64_u32(vmvnq_u32(vreinterpretq_u32_u64(done_a)));
+            let active_b = vreinterpretq_u64_u32(vmvnq_u32(vreinterpretq_u32_u64(done_b)));
+            let inc_a = vandq_u64(active_a, one_bits);
+            let inc_b = vandq_u64(active_b, one_bits);
+            counts_a = vaddq_f64(counts_a, vreinterpretq_f64_u64(inc_a));
+            counts_b = vaddq_f64(counts_b, vreinterpretq_f64_u64(inc_b));
+
+            done_a = vorrq_u64(done_a, esc_a);
+            done_b = vorrq_u64(done_b, esc_b);
+
+            let combined = vandq_u64(done_a, done_b);
+            if vminvq_u32(vreinterpretq_u32_u64(combined)) == u32::MAX {
+                break;
+            }
+
+            // new_zi = ci - 2*zr*zi via fused multiply-sub
+            let two_zr_a = vaddq_f64(zr_a, zr_a);
+            let two_zr_b = vaddq_f64(zr_b, zr_b);
+            let new_zi_a = vfmsq_f64(ci_a, two_zr_a, zi_a);
+            let new_zi_b = vfmsq_f64(ci_b, two_zr_b, zi_b);
+            let new_zr_a = vsubq_f64(vaddq_f64(zr2_a, cr_a), zi2_a);
+            let new_zr_b = vsubq_f64(vaddq_f64(zr2_b, cr_b), zi2_b);
+
+            zr_a = new_zr_a;
+            zi_a = new_zi_a;
+            zr_b = new_zr_b;
+            zi_b = new_zi_b;
+        }
+
+        let mut counts = [0.0f64; 4];
+        vst1q_f64(counts.as_mut_ptr(), counts_a);
+        vst1q_f64(counts.as_mut_ptr().add(2), counts_b);
+
+        let mag2_a = vaddq_f64(vmulq_f64(zr_a, zr_a), vmulq_f64(zi_a, zi_a));
+        let mag2_b = vaddq_f64(vmulq_f64(zr_b, zr_b), vmulq_f64(zi_b, zi_b));
+        let mut mag2 = [0.0f64; 4];
+        vst1q_f64(mag2.as_mut_ptr(), mag2_a);
+        vst1q_f64(mag2.as_mut_ptr().add(2), mag2_b);
+
+        let mut escaped = [0u64; 4];
+        vst1q_u64(escaped.as_mut_ptr(), done_a);
+        vst1q_u64(escaped.as_mut_ptr().add(2), done_b);
+
+        let mut result = [0.0f64; 4];
+        for k in 0..4 {
+            if escaped[k] != 0 && counts[k] > 0.0 {
+                let mag = mag2[k].sqrt();
+                result[k] = counts[k] + 1.0 - mag.ln().ln() / std::f64::consts::LN_2;
+            }
+        }
+        result
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn iterate_tricorn_4x(cr: f64x4, ci: f64x4, max_iter: u32) -> [f64; 4] {
+    let mut zr = f64x4::ZERO;
+    let mut zi = f64x4::ZERO;
+    let mut counts = f64x4::ZERO;
+    let one = f64x4::splat(1.0);
+    let threshold = f64x4::splat(65536.0);
+    let two = f64x4::splat(2.0);
+    let mut done_mask = f64x4::ZERO;
+
+    for _ in 0..max_iter {
+        let zr2 = zr * zr;
+        let zi2 = zi * zi;
+        let mag2 = zr2 + zi2;
+        let just_escaped = mag2.cmp_gt(threshold);
+
+        let active = !done_mask;
+        counts = counts + (active & one);
+
+        done_mask = done_mask | just_escaped;
+        if done_mask.all() { break; }
+
+        let new_zr = zr2 - zi2 + cr;
+        let new_zi = ci - two * zr * zi;
+        zr = new_zr;
+        zi = new_zi;
+    }
+
+    let mag2_arr: [f64; 4] = bytemuck::cast(zr * zr + zi * zi);
+    let counts_arr: [f64; 4] = bytemuck::cast(counts);
+    let escaped_arr: [u64; 4] = bytemuck::cast(done_mask);
+    let mut result = [0.0f64; 4];
+    for k in 0..4 {
+        if escaped_arr[k] != 0 && counts_arr[k] > 0.0 {
+            let mag = mag2_arr[k].sqrt();
+            result[k] = counts_arr[k] + 1.0 - mag.ln().ln() / std::f64::consts::LN_2;
+        }
+    }
+    result
+}
+
 pub fn compute_tricorn(
     width: u32, height: u32,
     center: (f64, f64), zoom: f64, max_iter: u32,
@@ -1696,16 +1829,26 @@ pub fn compute_tricorn(
     let y_min = center.1 - y_range / 2.0;
     let x_step = x_range / width as f64;
     let y_step = y_range / height as f64;
+    let step4 = f64x4::from([0.0, 1.0, 2.0, 3.0]) * f64x4::splat(x_step);
 
     let mut result = vec![0.0f64; w * h];
     result
         .par_chunks_mut(w)
         .enumerate()
         .for_each(|(py, row)| {
-            let ci = y_min + py as f64 * y_step;
-            for px in 0..w {
+            let ci = f64x4::splat(y_min + py as f64 * y_step);
+            let mut px = 0;
+            while px + 4 <= w {
+                let base_cr = x_min + px as f64 * x_step;
+                let cr = f64x4::splat(base_cr) + step4;
+                let vals = iterate_tricorn_4x(cr, ci, max_iter);
+                row[px..px + 4].copy_from_slice(&vals);
+                px += 4;
+            }
+            while px < w {
                 let cr = x_min + px as f64 * x_step;
-                row[px] = iterate_tricorn(cr, ci, max_iter);
+                row[px] = iterate_tricorn(cr, y_min + py as f64 * y_step, max_iter);
+                px += 1;
             }
         });
     result
@@ -1766,6 +1909,158 @@ fn find_interesting_tricorn(rng: &mut Rng, max_iter: u32, width: u32, height: u3
 
 // ── Phoenix Fractal ─────────────────────────────────────────────────────────
 
+/// SIMD smooth iteration for 4 Phoenix pixels at once.
+/// Phoenix: z_{n+1} = z_n^2 + cr + ci * z_{n-1}
+/// Each lane carries its own (zr, zi, zr_prev, zi_prev). The constants cr
+/// and ci are shared across lanes.
+#[cfg(target_arch = "aarch64")]
+fn iterate_phoenix_4x(zr0_v: f64x4, zi0_v: f64x4, cr_val: f64, ci_val: f64, max_iter: u32) -> [f64; 4] {
+    use core::arch::aarch64::*;
+
+    let zr0_arr: [f64; 4] = bytemuck::cast(zr0_v);
+    let zi0_arr: [f64; 4] = bytemuck::cast(zi0_v);
+
+    unsafe {
+        let cr = vdupq_n_f64(cr_val);
+        let ci = vdupq_n_f64(ci_val);
+        let threshold = vdupq_n_f64(65536.0);
+        let one_bits = vdupq_n_u64(0x3FF0000000000000);
+        let zero_f = vdupq_n_f64(0.0);
+
+        let mut zr_a = vld1q_f64(zr0_arr.as_ptr());
+        let mut zr_b = vld1q_f64(zr0_arr.as_ptr().add(2));
+        let mut zi_a = vld1q_f64(zi0_arr.as_ptr());
+        let mut zi_b = vld1q_f64(zi0_arr.as_ptr().add(2));
+        let mut zr_prev_a = zero_f;
+        let mut zr_prev_b = zero_f;
+        let mut zi_prev_a = zero_f;
+        let mut zi_prev_b = zero_f;
+        let mut counts_a = zero_f;
+        let mut counts_b = zero_f;
+        let mut done_a = vreinterpretq_u64_f64(zero_f);
+        let mut done_b = vreinterpretq_u64_f64(zero_f);
+
+        for _ in 0..max_iter {
+            let zr2_a = vmulq_f64(zr_a, zr_a);
+            let zi2_a = vmulq_f64(zi_a, zi_a);
+            let mag2_a = vaddq_f64(zr2_a, zi2_a);
+            let esc_a = vcgtq_f64(mag2_a, threshold);
+
+            let zr2_b = vmulq_f64(zr_b, zr_b);
+            let zi2_b = vmulq_f64(zi_b, zi_b);
+            let mag2_b = vaddq_f64(zr2_b, zi2_b);
+            let esc_b = vcgtq_f64(mag2_b, threshold);
+
+            let active_a = vreinterpretq_u64_u32(vmvnq_u32(vreinterpretq_u32_u64(done_a)));
+            let active_b = vreinterpretq_u64_u32(vmvnq_u32(vreinterpretq_u32_u64(done_b)));
+            let inc_a = vandq_u64(active_a, one_bits);
+            let inc_b = vandq_u64(active_b, one_bits);
+            counts_a = vaddq_f64(counts_a, vreinterpretq_f64_u64(inc_a));
+            counts_b = vaddq_f64(counts_b, vreinterpretq_f64_u64(inc_b));
+
+            done_a = vorrq_u64(done_a, esc_a);
+            done_b = vorrq_u64(done_b, esc_b);
+
+            let combined = vandq_u64(done_a, done_b);
+            if vminvq_u32(vreinterpretq_u32_u64(combined)) == u32::MAX {
+                break;
+            }
+
+            // new_zr = (zr^2 - zi^2 + cr) + ci * zr_prev
+            let zr_no_prev_a = vsubq_f64(vaddq_f64(zr2_a, cr), zi2_a);
+            let zr_no_prev_b = vsubq_f64(vaddq_f64(zr2_b, cr), zi2_b);
+            let new_zr_a = vfmaq_f64(zr_no_prev_a, ci, zr_prev_a);
+            let new_zr_b = vfmaq_f64(zr_no_prev_b, ci, zr_prev_b);
+            // new_zi = (ci * zi_prev) + 2*zr*zi
+            let two_zr_a = vaddq_f64(zr_a, zr_a);
+            let two_zr_b = vaddq_f64(zr_b, zr_b);
+            let ci_zi_prev_a = vmulq_f64(ci, zi_prev_a);
+            let ci_zi_prev_b = vmulq_f64(ci, zi_prev_b);
+            let new_zi_a = vfmaq_f64(ci_zi_prev_a, two_zr_a, zi_a);
+            let new_zi_b = vfmaq_f64(ci_zi_prev_b, two_zr_b, zi_b);
+
+            zr_prev_a = zr_a;
+            zr_prev_b = zr_b;
+            zi_prev_a = zi_a;
+            zi_prev_b = zi_b;
+            zr_a = new_zr_a;
+            zr_b = new_zr_b;
+            zi_a = new_zi_a;
+            zi_b = new_zi_b;
+        }
+
+        let mut counts = [0.0f64; 4];
+        vst1q_f64(counts.as_mut_ptr(), counts_a);
+        vst1q_f64(counts.as_mut_ptr().add(2), counts_b);
+
+        let mag2_a = vaddq_f64(vmulq_f64(zr_a, zr_a), vmulq_f64(zi_a, zi_a));
+        let mag2_b = vaddq_f64(vmulq_f64(zr_b, zr_b), vmulq_f64(zi_b, zi_b));
+        let mut mag2 = [0.0f64; 4];
+        vst1q_f64(mag2.as_mut_ptr(), mag2_a);
+        vst1q_f64(mag2.as_mut_ptr().add(2), mag2_b);
+
+        let mut escaped = [0u64; 4];
+        vst1q_u64(escaped.as_mut_ptr(), done_a);
+        vst1q_u64(escaped.as_mut_ptr().add(2), done_b);
+
+        let mut result = [0.0f64; 4];
+        for k in 0..4 {
+            if escaped[k] != 0 && counts[k] > 0.0 {
+                let mag = mag2[k].sqrt();
+                result[k] = counts[k] + 1.0 - mag.ln().ln() / std::f64::consts::LN_2;
+            }
+        }
+        result
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn iterate_phoenix_4x(zr0: f64x4, zi0: f64x4, cr_val: f64, ci_val: f64, max_iter: u32) -> [f64; 4] {
+    let cr = f64x4::splat(cr_val);
+    let ci = f64x4::splat(ci_val);
+    let mut zr = zr0;
+    let mut zi = zi0;
+    let mut zr_prev = f64x4::ZERO;
+    let mut zi_prev = f64x4::ZERO;
+    let mut counts = f64x4::ZERO;
+    let one = f64x4::splat(1.0);
+    let threshold = f64x4::splat(65536.0);
+    let two = f64x4::splat(2.0);
+    let mut done_mask = f64x4::ZERO;
+
+    for _ in 0..max_iter {
+        let zr2 = zr * zr;
+        let zi2 = zi * zi;
+        let mag2 = zr2 + zi2;
+        let just_escaped = mag2.cmp_gt(threshold);
+
+        let active = !done_mask;
+        counts = counts + (active & one);
+
+        done_mask = done_mask | just_escaped;
+        if done_mask.all() { break; }
+
+        let new_zr = zr2 - zi2 + cr + ci * zr_prev;
+        let new_zi = two * zr * zi + ci * zi_prev;
+        zr_prev = zr;
+        zi_prev = zi;
+        zr = new_zr;
+        zi = new_zi;
+    }
+
+    let mag2_arr: [f64; 4] = bytemuck::cast(zr * zr + zi * zi);
+    let counts_arr: [f64; 4] = bytemuck::cast(counts);
+    let escaped_arr: [u64; 4] = bytemuck::cast(done_mask);
+    let mut result = [0.0f64; 4];
+    for k in 0..4 {
+        if escaped_arr[k] != 0 && counts_arr[k] > 0.0 {
+            let mag = mag2_arr[k].sqrt();
+            result[k] = counts_arr[k] + 1.0 - mag.ln().ln() / std::f64::consts::LN_2;
+        }
+    }
+    result
+}
+
 pub fn compute_phoenix(
     width: u32, height: u32,
     c: (f64, f64), zoom: f64, max_iter: u32,
@@ -1779,16 +2074,27 @@ pub fn compute_phoenix(
     let y_min = -y_range / 2.0;
     let x_step = x_range / width as f64;
     let y_step = y_range / height as f64;
+    let step4 = f64x4::from([0.0, 1.0, 2.0, 3.0]) * f64x4::splat(x_step);
 
     let mut result = vec![0.0f64; w * h];
     result
         .par_chunks_mut(w)
         .enumerate()
         .for_each(|(py, row)| {
-            for px in 0..w {
+            let zi0 = f64x4::splat(y_min + py as f64 * y_step);
+            let mut px = 0;
+            while px + 4 <= w {
+                let base_zr = x_min + px as f64 * x_step;
+                let zr0 = f64x4::splat(base_zr) + step4;
+                let vals = iterate_phoenix_4x(zr0, zi0, c.0, c.1, max_iter);
+                row[px..px + 4].copy_from_slice(&vals);
+                px += 4;
+            }
+            while px < w {
                 let zr = x_min + px as f64 * x_step;
                 let zi = y_min + py as f64 * y_step;
                 row[px] = iterate_phoenix(zr, zi, c.0, c.1, max_iter);
+                px += 1;
             }
         });
     result
