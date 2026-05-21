@@ -3,7 +3,9 @@ pub use image::{Rgb, RgbImage};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use wide::{f64x4, CmpGt};
+use wide::f64x4;
+#[cfg(not(target_arch = "aarch64"))]
+use wide::CmpGt;
 
 pub const DEFAULT_WIDTH: u32 = 5440;
 pub const DEFAULT_HEIGHT: u32 = 1440;
@@ -995,7 +997,135 @@ fn find_interesting_newton(rng: &mut Rng, _max_iter: u32) -> FractalParams {
 // ── Fractal Computation (full image) ────────────────────────────────────────
 
 /// SIMD smooth iteration for 4 Mandelbrot pixels at once.
-/// Uses SIMD masks throughout the hot loop — no scalar extraction until the end.
+/// On aarch64 we use a hand-written NEON path with explicit FMA
+/// (vfmaq_f64), which the `wide` crate's aarch64 fallback does not
+/// emit (its mul_add only fuses on x86 FMA). Elsewhere we use the
+/// portable `wide::f64x4` path. Both code paths are bit-identical
+/// for non-FMA arithmetic; FMA changes rounding by one ulp on the
+/// 2*zr*zi term, which is well below the smooth-coloring threshold.
+#[cfg(target_arch = "aarch64")]
+fn iterate_mandelbrot_4x(cr_v: f64x4, ci_v: f64x4, max_iter: u32) -> [f64; 4] {
+    use core::arch::aarch64::*;
+
+    let cr_arr: [f64; 4] = bytemuck::cast(cr_v);
+    let ci_arr: [f64; 4] = bytemuck::cast(ci_v);
+
+    let mut skip = [false; 4];
+    let mut any_active = false;
+    for k in 0..4 {
+        if in_cardioid_or_bulb(cr_arr[k], ci_arr[k]) {
+            skip[k] = true;
+        } else {
+            any_active = true;
+        }
+    }
+    if !any_active {
+        return [0.0; 4];
+    }
+
+    unsafe {
+        let cr_a = vld1q_f64(cr_arr.as_ptr());
+        let cr_b = vld1q_f64(cr_arr.as_ptr().add(2));
+        let ci_a = vld1q_f64(ci_arr.as_ptr());
+        let ci_b = vld1q_f64(ci_arr.as_ptr().add(2));
+        let threshold = vdupq_n_f64(65536.0);
+        let one_bits = vdupq_n_u64(0x3FF0000000000000); // bit pattern of f64 1.0
+        let zero_f = vdupq_n_f64(0.0);
+
+        let to_mask = |s0: bool, s1: bool| -> uint64x2_t {
+            let arr = [
+                if s0 { u64::MAX } else { 0 },
+                if s1 { u64::MAX } else { 0 },
+            ];
+            vld1q_u64(arr.as_ptr())
+        };
+        let skip_a = to_mask(skip[0], skip[1]);
+        let skip_b = to_mask(skip[2], skip[3]);
+
+        let mut zr_a = zero_f;
+        let mut zi_a = zero_f;
+        let mut zr_b = zero_f;
+        let mut zi_b = zero_f;
+        let mut counts_a = zero_f;
+        let mut counts_b = zero_f;
+        let mut done_a = skip_a;
+        let mut done_b = skip_b;
+
+        for _ in 0..max_iter {
+            let zr2_a = vmulq_f64(zr_a, zr_a);
+            let zi2_a = vmulq_f64(zi_a, zi_a);
+            let mag2_a = vaddq_f64(zr2_a, zi2_a);
+            let esc_a = vcgtq_f64(mag2_a, threshold);
+
+            let zr2_b = vmulq_f64(zr_b, zr_b);
+            let zi2_b = vmulq_f64(zi_b, zi_b);
+            let mag2_b = vaddq_f64(zr2_b, zi2_b);
+            let esc_b = vcgtq_f64(mag2_b, threshold);
+
+            // Increment counts for lanes still active at start of iter
+            // (lane that escapes this iter was active before update, so
+            // it gets one final increment — matches the wide path).
+            let active_a = vreinterpretq_u64_u32(vmvnq_u32(vreinterpretq_u32_u64(done_a)));
+            let active_b = vreinterpretq_u64_u32(vmvnq_u32(vreinterpretq_u32_u64(done_b)));
+            let inc_a = vandq_u64(active_a, one_bits);
+            let inc_b = vandq_u64(active_b, one_bits);
+            counts_a = vaddq_f64(counts_a, vreinterpretq_f64_u64(inc_a));
+            counts_b = vaddq_f64(counts_b, vreinterpretq_f64_u64(inc_b));
+
+            done_a = vorrq_u64(done_a, esc_a);
+            done_b = vorrq_u64(done_b, esc_b);
+
+            let combined = vandq_u64(done_a, done_b);
+            if vminvq_u32(vreinterpretq_u32_u64(combined)) == u32::MAX {
+                break;
+            }
+
+            // new_zi = ci + (2*zr) * zi via fused multiply-add
+            let two_zr_a = vaddq_f64(zr_a, zr_a);
+            let two_zr_b = vaddq_f64(zr_b, zr_b);
+            let new_zi_a = vfmaq_f64(ci_a, two_zr_a, zi_a);
+            let new_zi_b = vfmaq_f64(ci_b, two_zr_b, zi_b);
+            // new_zr = (zr^2 + cr) - zi^2
+            let new_zr_a = vsubq_f64(vaddq_f64(zr2_a, cr_a), zi2_a);
+            let new_zr_b = vsubq_f64(vaddq_f64(zr2_b, cr_b), zi2_b);
+
+            zr_a = new_zr_a;
+            zi_a = new_zi_a;
+            zr_b = new_zr_b;
+            zi_b = new_zi_b;
+        }
+
+        let mut counts = [0.0f64; 4];
+        vst1q_f64(counts.as_mut_ptr(), counts_a);
+        vst1q_f64(counts.as_mut_ptr().add(2), counts_b);
+
+        let mag2_a = vaddq_f64(vmulq_f64(zr_a, zr_a), vmulq_f64(zi_a, zi_a));
+        let mag2_b = vaddq_f64(vmulq_f64(zr_b, zr_b), vmulq_f64(zi_b, zi_b));
+        let mut mag2 = [0.0f64; 4];
+        vst1q_f64(mag2.as_mut_ptr(), mag2_a);
+        vst1q_f64(mag2.as_mut_ptr().add(2), mag2_b);
+
+        // Escaped = done AND NOT skip (don't smooth-color cardioid lanes)
+        let not_skip_a = vreinterpretq_u64_u32(vmvnq_u32(vreinterpretq_u32_u64(skip_a)));
+        let not_skip_b = vreinterpretq_u64_u32(vmvnq_u32(vreinterpretq_u32_u64(skip_b)));
+        let escaped_a = vandq_u64(done_a, not_skip_a);
+        let escaped_b = vandq_u64(done_b, not_skip_b);
+        let mut escaped = [0u64; 4];
+        vst1q_u64(escaped.as_mut_ptr(), escaped_a);
+        vst1q_u64(escaped.as_mut_ptr().add(2), escaped_b);
+
+        let mut result = [0.0f64; 4];
+        for k in 0..4 {
+            if escaped[k] != 0 && counts[k] > 0.0 {
+                let mag = mag2[k].sqrt();
+                result[k] = counts[k] + 1.0 - mag.ln().ln() / std::f64::consts::LN_2;
+            }
+        }
+        result
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
 fn iterate_mandelbrot_4x(cr: f64x4, ci: f64x4, max_iter: u32) -> [f64; 4] {
     // Pre-check cardioid/bulb for each lane
     let cr_arr: [f64; 4] = bytemuck::cast(cr);
@@ -1112,7 +1242,99 @@ pub fn compute_mandelbrot(
 }
 
 /// SIMD smooth iteration for 4 Julia pixels at once.
-/// Uses SIMD masks throughout — no scalar extraction in the hot loop.
+/// On aarch64: NEON intrinsics with explicit FMA. Elsewhere: wide::f64x4.
+#[cfg(target_arch = "aarch64")]
+fn iterate_julia_4x(zr0_v: f64x4, zi0_v: f64x4, cr_v: f64x4, ci_v: f64x4, max_iter: u32) -> [f64; 4] {
+    use core::arch::aarch64::*;
+
+    let zr0_arr: [f64; 4] = bytemuck::cast(zr0_v);
+    let zi0_arr: [f64; 4] = bytemuck::cast(zi0_v);
+    let cr_arr: [f64; 4] = bytemuck::cast(cr_v);
+    let ci_arr: [f64; 4] = bytemuck::cast(ci_v);
+
+    unsafe {
+        let cr_a = vld1q_f64(cr_arr.as_ptr());
+        let cr_b = vld1q_f64(cr_arr.as_ptr().add(2));
+        let ci_a = vld1q_f64(ci_arr.as_ptr());
+        let ci_b = vld1q_f64(ci_arr.as_ptr().add(2));
+        let threshold = vdupq_n_f64(65536.0);
+        let one_bits = vdupq_n_u64(0x3FF0000000000000);
+        let zero_f = vdupq_n_f64(0.0);
+
+        let mut zr_a = vld1q_f64(zr0_arr.as_ptr());
+        let mut zr_b = vld1q_f64(zr0_arr.as_ptr().add(2));
+        let mut zi_a = vld1q_f64(zi0_arr.as_ptr());
+        let mut zi_b = vld1q_f64(zi0_arr.as_ptr().add(2));
+        let mut counts_a = zero_f;
+        let mut counts_b = zero_f;
+        let mut done_a = vreinterpretq_u64_f64(zero_f);
+        let mut done_b = vreinterpretq_u64_f64(zero_f);
+
+        for _ in 0..max_iter {
+            let zr2_a = vmulq_f64(zr_a, zr_a);
+            let zi2_a = vmulq_f64(zi_a, zi_a);
+            let mag2_a = vaddq_f64(zr2_a, zi2_a);
+            let esc_a = vcgtq_f64(mag2_a, threshold);
+
+            let zr2_b = vmulq_f64(zr_b, zr_b);
+            let zi2_b = vmulq_f64(zi_b, zi_b);
+            let mag2_b = vaddq_f64(zr2_b, zi2_b);
+            let esc_b = vcgtq_f64(mag2_b, threshold);
+
+            let active_a = vreinterpretq_u64_u32(vmvnq_u32(vreinterpretq_u32_u64(done_a)));
+            let active_b = vreinterpretq_u64_u32(vmvnq_u32(vreinterpretq_u32_u64(done_b)));
+            let inc_a = vandq_u64(active_a, one_bits);
+            let inc_b = vandq_u64(active_b, one_bits);
+            counts_a = vaddq_f64(counts_a, vreinterpretq_f64_u64(inc_a));
+            counts_b = vaddq_f64(counts_b, vreinterpretq_f64_u64(inc_b));
+
+            done_a = vorrq_u64(done_a, esc_a);
+            done_b = vorrq_u64(done_b, esc_b);
+
+            let combined = vandq_u64(done_a, done_b);
+            if vminvq_u32(vreinterpretq_u32_u64(combined)) == u32::MAX {
+                break;
+            }
+
+            let two_zr_a = vaddq_f64(zr_a, zr_a);
+            let two_zr_b = vaddq_f64(zr_b, zr_b);
+            let new_zi_a = vfmaq_f64(ci_a, two_zr_a, zi_a);
+            let new_zi_b = vfmaq_f64(ci_b, two_zr_b, zi_b);
+            let new_zr_a = vsubq_f64(vaddq_f64(zr2_a, cr_a), zi2_a);
+            let new_zr_b = vsubq_f64(vaddq_f64(zr2_b, cr_b), zi2_b);
+
+            zr_a = new_zr_a;
+            zi_a = new_zi_a;
+            zr_b = new_zr_b;
+            zi_b = new_zi_b;
+        }
+
+        let mut counts = [0.0f64; 4];
+        vst1q_f64(counts.as_mut_ptr(), counts_a);
+        vst1q_f64(counts.as_mut_ptr().add(2), counts_b);
+
+        let mag2_a = vaddq_f64(vmulq_f64(zr_a, zr_a), vmulq_f64(zi_a, zi_a));
+        let mag2_b = vaddq_f64(vmulq_f64(zr_b, zr_b), vmulq_f64(zi_b, zi_b));
+        let mut mag2 = [0.0f64; 4];
+        vst1q_f64(mag2.as_mut_ptr(), mag2_a);
+        vst1q_f64(mag2.as_mut_ptr().add(2), mag2_b);
+
+        let mut escaped = [0u64; 4];
+        vst1q_u64(escaped.as_mut_ptr(), done_a);
+        vst1q_u64(escaped.as_mut_ptr().add(2), done_b);
+
+        let mut result = [0.0f64; 4];
+        for k in 0..4 {
+            if escaped[k] != 0 && counts[k] > 0.0 {
+                let mag = mag2[k].sqrt();
+                result[k] = counts[k] + 1.0 - mag.ln().ln() / std::f64::consts::LN_2;
+            }
+        }
+        result
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
 fn iterate_julia_4x(zr0: f64x4, zi0: f64x4, cr: f64x4, ci: f64x4, max_iter: u32) -> [f64; 4] {
     let mut zr = zr0;
     let mut zi = zi0;
@@ -1199,7 +1421,105 @@ pub fn compute_julia(
 }
 
 /// SIMD smooth iteration for 4 Burning Ship pixels at once.
-/// Uses SIMD masks throughout — no scalar extraction in the hot loop.
+/// On aarch64: NEON intrinsics with explicit FMA. Elsewhere: wide::f64x4.
+#[cfg(target_arch = "aarch64")]
+fn iterate_burning_ship_4x(cr_v: f64x4, ci_v: f64x4, max_iter: u32) -> [f64; 4] {
+    use core::arch::aarch64::*;
+
+    let cr_arr: [f64; 4] = bytemuck::cast(cr_v);
+    let ci_arr: [f64; 4] = bytemuck::cast(ci_v);
+
+    unsafe {
+        let cr_a = vld1q_f64(cr_arr.as_ptr());
+        let cr_b = vld1q_f64(cr_arr.as_ptr().add(2));
+        let ci_a = vld1q_f64(ci_arr.as_ptr());
+        let ci_b = vld1q_f64(ci_arr.as_ptr().add(2));
+        let threshold = vdupq_n_f64(65536.0);
+        let one_bits = vdupq_n_u64(0x3FF0000000000000);
+        let zero_f = vdupq_n_f64(0.0);
+
+        let mut zr_a = zero_f;
+        let mut zi_a = zero_f;
+        let mut zr_b = zero_f;
+        let mut zi_b = zero_f;
+        let mut counts_a = zero_f;
+        let mut counts_b = zero_f;
+        let mut done_a = vreinterpretq_u64_f64(zero_f);
+        let mut done_b = vreinterpretq_u64_f64(zero_f);
+
+        for _ in 0..max_iter {
+            // Burning ship: z = (|zr| + i|zi|)^2 + c
+            let azr_a = vabsq_f64(zr_a);
+            let azi_a = vabsq_f64(zi_a);
+            let azr_b = vabsq_f64(zr_b);
+            let azi_b = vabsq_f64(zi_b);
+
+            let zr2_a = vmulq_f64(azr_a, azr_a);
+            let zi2_a = vmulq_f64(azi_a, azi_a);
+            let mag2_a = vaddq_f64(zr2_a, zi2_a);
+            let esc_a = vcgtq_f64(mag2_a, threshold);
+
+            let zr2_b = vmulq_f64(azr_b, azr_b);
+            let zi2_b = vmulq_f64(azi_b, azi_b);
+            let mag2_b = vaddq_f64(zr2_b, zi2_b);
+            let esc_b = vcgtq_f64(mag2_b, threshold);
+
+            let active_a = vreinterpretq_u64_u32(vmvnq_u32(vreinterpretq_u32_u64(done_a)));
+            let active_b = vreinterpretq_u64_u32(vmvnq_u32(vreinterpretq_u32_u64(done_b)));
+            let inc_a = vandq_u64(active_a, one_bits);
+            let inc_b = vandq_u64(active_b, one_bits);
+            counts_a = vaddq_f64(counts_a, vreinterpretq_f64_u64(inc_a));
+            counts_b = vaddq_f64(counts_b, vreinterpretq_f64_u64(inc_b));
+
+            done_a = vorrq_u64(done_a, esc_a);
+            done_b = vorrq_u64(done_b, esc_b);
+
+            let combined = vandq_u64(done_a, done_b);
+            if vminvq_u32(vreinterpretq_u32_u64(combined)) == u32::MAX {
+                break;
+            }
+
+            // new_zi = ci + 2*|zr|*|zi|
+            let two_azr_a = vaddq_f64(azr_a, azr_a);
+            let two_azr_b = vaddq_f64(azr_b, azr_b);
+            let new_zi_a = vfmaq_f64(ci_a, two_azr_a, azi_a);
+            let new_zi_b = vfmaq_f64(ci_b, two_azr_b, azi_b);
+            // new_zr = (zr^2 + cr) - zi^2
+            let new_zr_a = vsubq_f64(vaddq_f64(zr2_a, cr_a), zi2_a);
+            let new_zr_b = vsubq_f64(vaddq_f64(zr2_b, cr_b), zi2_b);
+
+            zr_a = new_zr_a;
+            zi_a = new_zi_a;
+            zr_b = new_zr_b;
+            zi_b = new_zi_b;
+        }
+
+        let mut counts = [0.0f64; 4];
+        vst1q_f64(counts.as_mut_ptr(), counts_a);
+        vst1q_f64(counts.as_mut_ptr().add(2), counts_b);
+
+        let mag2_a = vaddq_f64(vmulq_f64(zr_a, zr_a), vmulq_f64(zi_a, zi_a));
+        let mag2_b = vaddq_f64(vmulq_f64(zr_b, zr_b), vmulq_f64(zi_b, zi_b));
+        let mut mag2 = [0.0f64; 4];
+        vst1q_f64(mag2.as_mut_ptr(), mag2_a);
+        vst1q_f64(mag2.as_mut_ptr().add(2), mag2_b);
+
+        let mut escaped = [0u64; 4];
+        vst1q_u64(escaped.as_mut_ptr(), done_a);
+        vst1q_u64(escaped.as_mut_ptr().add(2), done_b);
+
+        let mut result = [0.0f64; 4];
+        for k in 0..4 {
+            if escaped[k] != 0 && counts[k] > 0.0 {
+                let mag = mag2[k].sqrt();
+                result[k] = counts[k] + 1.0 - mag.ln().ln() / std::f64::consts::LN_2;
+            }
+        }
+        result
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
 fn iterate_burning_ship_4x(cr: f64x4, ci: f64x4, max_iter: u32) -> [f64; 4] {
     let mut zr = f64x4::ZERO;
     let mut zi = f64x4::ZERO;
