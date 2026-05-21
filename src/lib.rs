@@ -8,6 +8,82 @@ use wide::{f64x4, CmpGt};
 pub const DEFAULT_WIDTH: u32 = 5440;
 pub const DEFAULT_HEIGHT: u32 = 1440;
 
+// ── Heterogeneous-core CPU affinity (opt-in) ────────────────────────────────
+//
+// On heterogeneous systems (Apple Silicon under Asahi Linux, big.LITTLE ARM,
+// Intel Alder Lake P/E hybrid) the kernel exposes per-CPU capacity via
+// `/sys/devices/system/cpu/cpuN/cpu_capacity`. Performance cores have a
+// higher value (1024 on M1; E-cores ~493).
+//
+// Setting FRACTAL_PCORE_ONLY=1 installs a global rayon pool sized to the
+// P-core count with each worker pinned to one specific P-core via
+// `sched_setaffinity`. On uniform systems it is a no-op.
+//
+// This is OFF by default because for the SIMD-bound escape kernels
+// (mandelbrot, julia, burning ship, tricorn, phoenix, newton) discarding
+// the E-cores costs more total throughput than the tail-latency win.
+// Measured on Apple M1 / Asahi at 1920x1080 with FRACTAL_PCORE_ONLY=1:
+//   SIMD escape kernels:   +45-50% wall time  (lost ~4 E-cores of compute)
+//   Histogram kernels:     ~ -3-4% wall time  (less atomic contention)
+//
+// The toggle is left available for histogram-heavy workflows where the
+// small win matters.
+#[cfg(target_os = "linux")]
+pub fn maybe_pin_to_pcores() {
+    use std::fs;
+
+    if std::env::var_os("FRACTAL_PCORE_ONLY").is_none() {
+        return;
+    }
+
+    let mut cpus: Vec<(usize, u64)> = (0..)
+        .map_while(|i| {
+            fs::read_to_string(format!("/sys/devices/system/cpu/cpu{i}/cpu_capacity"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(|cap| (i, cap))
+        })
+        .collect();
+
+    if cpus.is_empty() {
+        return;
+    }
+
+    let total = cpus.len();
+    let max_cap = cpus.iter().map(|(_, c)| *c).max().unwrap();
+    cpus.retain(|(_, c)| *c == max_cap);
+
+    // Uniform topology: nothing to gain from pinning, let the OS schedule.
+    if cpus.len() == total {
+        return;
+    }
+
+    let pcores: Vec<usize> = cpus.iter().map(|(i, _)| *i).collect();
+    let n = pcores.len();
+    let pcores_for_handler = pcores.clone();
+
+    let res = rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .start_handler(move |thread_idx| {
+            let cpu = pcores_for_handler[thread_idx];
+            unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                libc::CPU_ZERO(&mut set);
+                libc::CPU_SET(cpu, &mut set);
+                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+            }
+        })
+        .build_global();
+
+    if res.is_ok() {
+        let list: Vec<String> = pcores.iter().map(|c| c.to_string()).collect();
+        eprintln!("Pinned rayon to {n} performance cores (CPUs: {})", list.join(","));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn maybe_pin_to_pcores() {}
+
 // ── Simple PRNG (xoshiro256**) ──────────────────────────────────────────────
 
 pub struct Rng {

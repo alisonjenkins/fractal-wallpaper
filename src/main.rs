@@ -223,6 +223,7 @@ fn generate_and_save(
 
 fn main() {
     let cli = Cli::parse();
+    maybe_pin_to_pcores();
 
     // Load params from file if requested
     if let Some(ref load_path) = cli.load_params {

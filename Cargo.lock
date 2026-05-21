@@ -420,6 +420,7 @@ dependencies = [
  "bytemuck",
  "clap",
  "image",
+ "libc",
  "rayon",
  "serde",
  "serde_json",
