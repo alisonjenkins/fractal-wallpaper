@@ -1,2 +1,12 @@
 [build]
+
+# x86-64 keeps `-C target-cpu=native`: enables AVX/AVX2/FMA on supporting CPUs.
+[target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-cpu=native"]
+
+# aarch64 also uses native CPU detection, plus explicit NEON + LSE atomics so
+# the `wide` crate's NEON code paths (gated on target_feature="neon") are
+# unconditionally selected even if `native` detection is conservative under
+# Asahi/M-series Linux. NEON is baseline on aarch64 so this is always safe.
+[target.'cfg(target_arch = "aarch64")']
+rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+neon,+lse"]

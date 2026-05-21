@@ -968,11 +968,9 @@ fn iterate_mandelbrot_4x(cr: f64x4, ci: f64x4, max_iter: u32) -> [f64; 4] {
         // Recompute: active lanes are those not yet done BEFORE this iteration's escape.
         let active = !done_mask | just_escaped; // Was active: not done, OR just now escaped
         let not_skip = !skip_mask; // Never count cardioid-skipped lanes
-        counts = counts + (active & not_skip).blend(one, f64x4::ZERO);
+        counts = counts + (active & not_skip & one);
 
-        // All lanes done?
-        let done_bits: [u64; 4] = bytemuck::cast(done_mask);
-        if done_bits[0] != 0 && done_bits[1] != 0 && done_bits[2] != 0 && done_bits[3] != 0 {
+        if done_mask.all() {
             break;
         }
 
@@ -1056,12 +1054,11 @@ fn iterate_julia_4x(zr0: f64x4, zi0: f64x4, cr: f64x4, ci: f64x4, max_iter: u32)
 
         // Increment counts for lanes not yet done (including those escaping now)
         let active = !done_mask;
-        counts = counts + active.blend(one, f64x4::ZERO);
+        counts = counts + (active & one);
 
         done_mask = done_mask | just_escaped;
 
-        let done_bits: [u64; 4] = bytemuck::cast(done_mask);
-        if done_bits[0] != 0 && done_bits[1] != 0 && done_bits[2] != 0 && done_bits[3] != 0 {
+        if done_mask.all() {
             break;
         }
 
@@ -1145,12 +1142,11 @@ fn iterate_burning_ship_4x(cr: f64x4, ci: f64x4, max_iter: u32) -> [f64; 4] {
         let just_escaped = mag2.cmp_gt(threshold);
 
         let active = !done_mask;
-        counts = counts + active.blend(one, f64x4::ZERO);
+        counts = counts + (active & one);
 
         done_mask = done_mask | just_escaped;
 
-        let done_bits: [u64; 4] = bytemuck::cast(done_mask);
-        if done_bits[0] != 0 && done_bits[1] != 0 && done_bits[2] != 0 && done_bits[3] != 0 {
+        if done_mask.all() {
             break;
         }
 
